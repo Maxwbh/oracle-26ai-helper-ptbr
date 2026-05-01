@@ -1,0 +1,50 @@
+oracle-26ai-helper-ptbr
+Copyright 2026 Maxwell da Silva Oliveira (M&S do Brasil)
+Contact: maxwbh@gmail.com
+GitHub: @maxwbh
+
+This product includes content derived from:
+
+----------------------------------------------------------------------
+Trivadis PL/SQL & SQL Coding Guidelines (version 4.4)
+Copyright (c) Trivadis AG and contributors
+Licensed under Apache License 2.0
+https://github.com/Trivadis/plsql-and-sql-coding-guidelines
+
+The Trivadis Coding Guidelines provide the foundation of naming
+conventions, prefix system, exception handling patterns, and
+overall coding philosophy applied throughout this skill, particularly
+for the PL/SQL portions of templates that integrate with Vector Search,
+JSON Relational Duality, and RAFT replication.
+
+----------------------------------------------------------------------
+Oracle-Base
+Tim Hall
+https://oracle-base.com/
+
+The "SQL > PL/SQL" canonical principle (#1) and several patterns
+related to NOCOPY for VECTOR/BLOB are inspired by articles authored
+by Tim Hall on Oracle-Base, including his coverage of Oracle 23ai
+and 26ai release update features.
+
+----------------------------------------------------------------------
+Oracle AI Database 26ai
+Copyright (c) Oracle Corporation
+
+Templates referencing VECTOR data type, DBMS_VECTOR, DBMS_VECTOR_CHAIN,
+DBMS_HYBRID_VECTOR, JSON RELATIONAL DUALITY VIEW syntax, and Globally
+Distributed Database commands are based on the official Oracle AI
+Database 26ai documentation:
+- AI Vector Search User's Guide
+- JSON-Relational Duality Developer's Guide
+- Globally Distributed Database User's Guide
+
+----------------------------------------------------------------------
+
+This skill is a derivative work that combines coding standards from
+Trivadis with patterns from official Oracle 26ai documentation,
+adapted to Brazilian Portuguese (PT-BR) contexts, and packaged as
+templates and references for use with Anthropic's Claude AI assistant.
+
+Trademarks of Oracle Corporation, Trivadis AG, and other entities are
+the property of their respective owners.
