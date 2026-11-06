@@ -7,47 +7,79 @@
 --
 -- Cenário típico: documentos longos (laudos, contratos, artigos) com 10-50k caracteres.
 -- Embedding direto de documento inteiro perde nuance — precisa chunking.
+--
+-- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Edição Free: Parcial — chunking e embedding com modelo ONNX no banco rodam
+--              no Free (limite de 2 GB de RAM pesa no modelo); a seção 6
+--              (provedor externo) exige rede de saída, ACL e credencial; o
+--              guia de licenças não lista Vector Search explicitamente p/ Free.
 --==============================================================================
 
 
 --==============================================================================
 -- 1. Chunking — quebrar documento longo em pedaços
 --
--- Modelos de embedding têm limite de tokens (~512 para MiniLM, 8192 para
--- text-embedding-3). Documentos longos precisam ser fatiados.
+-- Cada modelo de embedding tem um limite de tokens de entrada (consulte o
+-- model card). Além disso, UTL_TO_EMBEDDING aceita no máximo 4000 caracteres
+-- por entrada. Documentos longos precisam ser fatiados antes.
 --==============================================================================
 
--- DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS: chunking nativo
-SELECT chunk_data
-  FROM TABLE(
-    DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(
-      data       => 'Texto longo do laudo aqui, com várias frases e parágrafos. ' ||
-                    'Pode ter dezenas de milhares de caracteres. ' ||
-                    'O chunker quebra em pedaços que cabem no modelo.',
-      params     => JSON('{
-        "by"        : "words",      
-        "max"       : 100,           
-        "overlap"   : 10,            
-        "split"     : "sentence",    
-        "language"  : "portuguese",  
-        "normalize" : "all"
-      }')
-    )
-  );
+-- 26ai — DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS devolve VECTOR_ARRAY_T: cada elemento
+-- é um JSON {chunk_id, chunk_offset, chunk_length, chunk_data}. Use-a no FROM
+-- e extraia os campos de COLUMN_VALUE com JSON_VALUE.
+SELECT JSON_VALUE(c.column_value, '$.chunk_id'     RETURNING NUMBER) AS id_chunk,
+       JSON_VALUE(c.column_value, '$.chunk_offset' RETURNING NUMBER) AS posicao,
+       JSON_VALUE(c.column_value, '$.chunk_length' RETURNING NUMBER) AS tamanho,
+       JSON_VALUE(c.column_value, '$.chunk_data'   RETURNING VARCHAR2(4000)) AS texto
+  FROM DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(
+         'Texto longo do laudo aqui, com várias frases e parágrafos. ' ||
+         'Pode ter dezenas de milhares de caracteres. ' ||
+         'O chunker quebra em pedaços que cabem no modelo.',
+         JSON('{
+           "by"        : "words",
+           "max"       : 100,
+           "overlap"   : 10,
+           "split"     : "sentence",
+           "language"  : "portuguese",
+           "normalize" : "all"
+         }')
+       ) c;
 
--- Parâmetros explicados:
---   by: "words", "characters", "tokens"
---   max: tamanho máximo do chunk
---   overlap: sobreposição entre chunks (preserva contexto na borda)
---   split: "sentence" (preserva sentenças) ou "newline" ou "none"
---   language: idioma para tokenização inteligente
---   normalize: "all" (lowercase, trim, remove duplicados de whitespace)
+-- Parâmetros explicados (UTL_TO_CHUNKS):
+--   by:        "words" (default) | "characters" (ou "chars") | "vocabulary"
+--              ("vocabulary" conta tokens do tokenizer do modelo; exige
+--               vocabulário carregado com DBMS_VECTOR_CHAIN.CREATE_VOCABULARY)
+--   max:       words 10-1000 | characters 50-4000 | vocabulary 10-1000 (default 100)
+--   overlap:   texto do chunk anterior repetido no próximo; 5% a 20% de max
+--              (default 0)
+--   split:     "recursively" (default: blankline → newline → space → none) |
+--              "sentence" (só com by words/vocabulary) | "newline" |
+--              "blankline" | "space" | "none" | "custom" (+ "custom_list")
+--   language:  nome/abreviação de idioma NLS (default: NLS_LANGUAGE da sessão)
+--   normalize: "all" (default em UTL_TO_CHUNKS) | "none" | "options"
+--              (+ "norm_options": ["whitespace","punctuation","widechar"])
+--   extended:  true eleva o limite do chunk para 32767 bytes
+
+-- 26ai — alternativa em SQL puro: VECTOR_CHUNKS (função de tabela no FROM;
+-- devolve CHUNK_OFFSET, CHUNK_LENGTH, CHUNK_TEXT). Informe os parâmetros na
+-- ordem da doc. Atenção: em VECTOR_CHUNKS o NORMALIZE default é NONE.
+SELECT c.chunk_offset, c.chunk_length, c.chunk_text
+  FROM documentos_forenses d,
+       VECTOR_CHUNKS(d.conteudo
+                     BY words
+                     MAX 100
+                     OVERLAP 10
+                     SPLIT BY sentence
+                     LANGUAGE portuguese
+                     NORMALIZE all) c
+ WHERE d.id = 1;
 
 
 --==============================================================================
 -- 2. Tabela de chunks (relação 1:N com documento original)
 --==============================================================================
 
+-- 26ai
 CREATE TABLE chunks_documentos (
   id              NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   id_documento    NUMBER NOT NULL,
@@ -62,6 +94,15 @@ CREATE TABLE chunks_documentos (
 
 CREATE INDEX idx_chunks_id_doc ON chunks_documentos(id_documento);
 
+-- 26ai — índice vetorial nos chunks (usado pelo RAG; ver
+-- ai_vector_index_strategies.sql para escolher HNSW x IVF)
+CREATE VECTOR INDEX idx_chunks_embedding_hnsw
+ON chunks_documentos (embedding)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95
+PARAMETERS (TYPE HNSW, NEIGHBORS 32, EFCONSTRUCTION 200);
+
 
 --==============================================================================
 -- 3. Pipeline completo: documento → chunks → embeddings (DML único)
@@ -69,34 +110,66 @@ CREATE INDEX idx_chunks_id_doc ON chunks_documentos(id_documento);
 -- Princípio Tim Hall: SQL puro em vez de loop PL/SQL.
 --==============================================================================
 
--- Para um documento específico:
+-- 26ai — para um documento específico
 INSERT INTO chunks_documentos (id_documento, num_chunk, texto_chunk, embedding)
-SELECT 1 AS id_documento,
-       chunk_offset AS num_chunk,
-       chunk_data AS texto_chunk,
-       VECTOR_EMBEDDING(modelo_minilm_l12 USING chunk_data AS data) AS embedding
-  FROM TABLE(
-    DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(
-      data    => (SELECT conteudo FROM documentos_forenses WHERE id = 1),
-      params  => JSON('{"by":"words","max":100,"overlap":10,"split":"sentence","language":"portuguese"}')
-    )
-  );
+SELECT d.id,
+       JSON_VALUE(c.column_value, '$.chunk_id' RETURNING NUMBER),
+       JSON_VALUE(c.column_value, '$.chunk_data' RETURNING VARCHAR2(4000)),
+       VECTOR_EMBEDDING(modelo_minilm_l12 USING
+         JSON_VALUE(c.column_value, '$.chunk_data' RETURNING VARCHAR2(4000)) AS data)
+  FROM documentos_forenses d,
+       DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(
+         d.conteudo,
+         JSON('{"by":"words","max":100,"overlap":10,"split":"sentence","language":"portuguese"}')
+       ) c
+ WHERE d.id = 1;
 
 COMMIT;
 
+-- 26ai — variante encadeada da doc (UTL_TO_CHUNKS → UTL_TO_EMBEDDINGS),
+-- útil quando o modelo é trocado por parâmetro JSON ("provider":"database" =
+-- ONNX no banco; dá para trocar por um provedor externo sem mudar o SQL):
+-- SELECT d.id, et.embed_id, et.embed_data, TO_VECTOR(et.embed_vector)
+--   FROM documentos_forenses d,
+--        DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS(
+--          DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(d.conteudo, JSON('{"normalize":"all"}')),
+--          JSON('{"provider":"database", "model":"modelo_minilm_l12"}')) t,
+--        JSON_TABLE(t.column_value, '$[*]' COLUMNS (
+--          embed_id     NUMBER         PATH '$.embed_id',
+--          embed_data   VARCHAR2(4000) PATH '$.embed_data',
+--          embed_vector CLOB           PATH '$.embed_vector')) et;
+
 
 --==============================================================================
--- 4. Procedure para chunking + embedding em batch
+-- 4. Package para chunking + embedding em batch
 --==============================================================================
 
+-- 26ai
+CREATE OR REPLACE PACKAGE pipeline_embedding_pkg AS
+
+  -- Reprocessa um documento (apaga e recria seus chunks). Faz COMMIT.
+  PROCEDURE processar_documento (
+    p_id_documento  IN NUMBER,
+    p_modelo        IN VARCHAR2 DEFAULT NULL
+  );
+
+  -- Processa documentos criados desde p_data_corte ou ainda sem chunks.
+  PROCEDURE processar_pendentes (
+    p_data_corte IN DATE DEFAULT SYSDATE - 1
+  );
+
+END pipeline_embedding_pkg;
+/
+
+-- 26ai
 CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
 
-  gc_nome_pacote CONSTANT VARCHAR2(30) := 'PIPELINE_EMBEDDING_PKG';
+  gc_nome_pacote    CONSTANT VARCHAR2(30)  := 'PIPELINE_EMBEDDING_PKG';
 
   -- Configurações default
-  gc_chunk_max         CONSTANT PLS_INTEGER := 100;
-  gc_chunk_overlap     CONSTANT PLS_INTEGER := 10;
-  gc_modelo_default    CONSTANT VARCHAR2(30) := 'MODELO_MINILM_L12';
+  gc_modelo_default CONSTANT VARCHAR2(128) := 'MODELO_MINILM_L12';
+  gc_params_chunk   CONSTANT VARCHAR2(200) :=
+    '{"by":"words","max":100,"overlap":10,"split":"sentence","language":"portuguese"}';
 
   PROCEDURE processar_documento (
     p_id_documento  IN NUMBER,
@@ -104,9 +177,13 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
   ) IS
     lc_nome_unidade CONSTANT VARCHAR2(60) := gc_nome_pacote || '.processar_documento';
     l_conteudo      CLOB;
-    l_modelo        VARCHAR2(30) := NVL(p_modelo, gc_modelo_default);
+    l_modelo        VARCHAR2(128);
     l_qtd_chunks    PLS_INTEGER;
   BEGIN
+    -- O nome do modelo entra no SQL como identificador (VECTOR_EMBEDDING não
+    -- aceita bind no nome) → valida contra SQL injection.
+    l_modelo := DBMS_ASSERT.SIMPLE_SQL_NAME(NVL(p_modelo, gc_modelo_default));
+
     -- Recupera documento
     SELECT conteudo INTO l_conteudo
       FROM documentos_forenses
@@ -118,15 +195,13 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
     -- Insere novos chunks com embedding
     EXECUTE IMMEDIATE q'[
       INSERT INTO chunks_documentos (id_documento, num_chunk, texto_chunk, embedding)
-      SELECT :p_id, chunk_offset, chunk_data,
-             VECTOR_EMBEDDING(]' || l_modelo || q'[ USING chunk_data AS data)
-        FROM TABLE(
-          DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(
-            data => :p_conteudo,
-            params => JSON('{"by":"words","max":100,"overlap":10,"split":"sentence","language":"portuguese"}')
-          )
-        )
-    ]' USING p_id_documento, l_conteudo;
+      SELECT :p_id,
+             JSON_VALUE(c.column_value, '$.chunk_id' RETURNING NUMBER),
+             JSON_VALUE(c.column_value, '$.chunk_data' RETURNING VARCHAR2(4000)),
+             VECTOR_EMBEDDING(]' || l_modelo || q'[ USING
+               JSON_VALUE(c.column_value, '$.chunk_data' RETURNING VARCHAR2(4000)) AS data)
+        FROM DBMS_VECTOR_CHAIN.UTL_TO_CHUNKS(:p_conteudo, JSON(:p_params)) c
+    ]' USING p_id_documento, l_conteudo, gc_params_chunk;
 
     l_qtd_chunks := SQL%ROWCOUNT;
 
@@ -144,23 +219,27 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
     WHEN OTHERS THEN
       ROLLBACK;
       raise_application_error(-20999,
-        'Erro em ' || lc_nome_unidade || ': ' || SQLERRM);
+        'Erro em ' || lc_nome_unidade || ': ' || SQLERRM, TRUE);
   END processar_documento;
 
 
-  -- Processa todos documentos modificados desde data X
   PROCEDURE processar_pendentes (
     p_data_corte IN DATE DEFAULT SYSDATE - 1
   ) IS
     lc_nome_unidade CONSTANT VARCHAR2(60) := gc_nome_pacote || '.processar_pendentes';
     l_total_processados PLS_INTEGER := 0;
   BEGIN
-    FOR r IN (
-      SELECT id FROM documentos_forenses
-       WHERE data_criacao >= p_data_corte
-          OR id NOT IN (SELECT DISTINCT id_documento FROM chunks_documentos)
+    -- Loop por DOCUMENTO (não por linha de chunk): cada documento é uma
+    -- unidade de COMMIT/reprocessamento independente.
+    FOR r_documento IN (
+      SELECT d.id
+        FROM documentos_forenses d
+       WHERE d.data_criacao >= p_data_corte
+          OR NOT EXISTS (SELECT 1
+                           FROM chunks_documentos c
+                          WHERE c.id_documento = d.id)
     ) LOOP
-      processar_documento(r.id);
+      processar_documento(r_documento.id);
       l_total_processados := l_total_processados + 1;
     END LOOP;
 
@@ -177,21 +256,18 @@ END pipeline_embedding_pkg;
 -- 5. Search em chunks (RAG-friendly retrieval)
 --==============================================================================
 
--- Top N chunks mais similares à pergunta, retornando documento original
-WITH busca AS (
-  SELECT VECTOR_EMBEDDING(modelo_minilm_l12 USING
-           'qual a causa de morte no caso de trauma craniano' AS data
-         ) AS query_emb
-    FROM dual
-)
+-- 26ai — top N chunks mais similares à pergunta, com o documento original
 SELECT d.id        AS id_documento,
        d.titulo,
        c.num_chunk,
        c.texto_chunk,
-       VECTOR_DISTANCE(c.embedding, b.query_emb, COSINE) AS distancia
+       VECTOR_DISTANCE(
+         c.embedding,
+         VECTOR_EMBEDDING(modelo_minilm_l12 USING
+           'qual a causa de morte no caso de trauma craniano' AS data),
+         COSINE) AS distancia
   FROM chunks_documentos c
   JOIN documentos_forenses d ON d.id = c.id_documento
- CROSS JOIN busca b
  ORDER BY distancia
  FETCH APPROX FIRST 5 ROWS ONLY;
 
@@ -199,38 +275,55 @@ SELECT d.id        AS id_documento,
 --==============================================================================
 -- 6. Pipeline com modelo externo (REST API)
 --
--- Quando modelo é proprietário e roda fora do banco
--- (OpenAI, Azure OpenAI, Cohere, etc.).
--- DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDING faz HTTP call para gerar.
+-- Quando o modelo roda fora do banco (OpenAI, Cohere, OCI Generative AI,
+-- Google AI, Hugging Face, Vertex AI, Mistral, Ollama...).
+-- DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDING faz a chamada HTTP e devolve VECTOR.
 --==============================================================================
 
--- Setup: credential para o serviço
+-- Setup 1 (como SYS/DBA): liberar saída HTTP para o host do provedor
+-- (padrão de ACL; prefira o host exato em vez de '*')
 BEGIN
-  DBMS_VECTOR.CREATE_CREDENTIAL(
-    credential_name  => 'CRED_OPENAI',
-    params           => JSON('{
-      "user_ocid"          : "...",
-      "tenancy_ocid"       : "...",
-      "private_key"        : "...",
-      "fingerprint"        : "..."
-    }')
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => 'api.openai.com',
+    ace  => xs$ace_type(privilege_list => xs$name_list('connect'),
+                        principal_name => 'USUARIO_VETOR',
+                        principal_type => xs_acl.ptype_db));
+END;
+/
+GRANT CREATE CREDENTIAL TO usuario_vetor;
+-- Se houver proxy corporativo: EXEC UTL_HTTP.SET_PROXY('<host-proxy>:<porta>');
+
+-- 26ai — Setup 2 (como usuario_vetor): credential do provedor.
+-- OpenAI, Cohere, Google AI, Hugging Face e Vertex AI usam {"access_token": ...}.
+-- Só OCI Generative AI ("ocigenai") usa user_ocid/tenancy_ocid/
+-- compartment_ocid/private_key/fingerprint.
+-- Nunca deixe a chave real em script versionado.
+BEGIN
+  DBMS_VECTOR_CHAIN.CREATE_CREDENTIAL(
+    credential_name => 'CRED_OPENAI',
+    params          => JSON('{ "access_token": "<chave_api_openai>" }')
   );
 END;
 /
 
--- Geração via API externa
-SELECT VECTOR_EMBEDDING_TEXT
-  FROM TABLE(
-    DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDING(
-      data   => 'Texto a ser vetorizado',
-      params => JSON('{
-        "provider"        : "openai",
-        "credential_name" : "CRED_OPENAI",
-        "url"             : "https://api.openai.com/v1/embeddings",
-        "model"           : "text-embedding-3-large"
-      }')
-    )
-  );
+-- 26ai — geração via API externa: UTL_TO_EMBEDDING devolve UM VECTOR
+-- (função escalar no SELECT). Para vários chunks de uma vez use
+-- UTL_TO_EMBEDDINGS (no FROM, devolve VECTOR_ARRAY_T — ver seção 3).
+-- Atenção: a dimensão do modelo externo precisa casar com a coluna VECTOR(n);
+-- 384 (MiniLM) NÃO serve para modelos de outras dimensões.
+SELECT DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDING(
+         'Texto a ser vetorizado',
+         JSON('{
+           "provider"        : "openai",
+           "credential_name" : "CRED_OPENAI",
+           "url"             : "https://api.openai.com/v1/embeddings",
+           "model"           : "<modelo_embedding_openai>"
+         }')
+       ) AS embedding
+  FROM dual;
+-- "model": use um modelo de embedding vigente do provedor (a doc Oracle usa
+-- "text-embedding-3-small" como exemplo). Opcionais: "transfer_timeout"
+-- (default 60 s) e "max_count" (limita o nº de chamadas ao provedor).
 
 
 --==============================================================================
@@ -238,13 +331,15 @@ SELECT VECTOR_EMBEDDING_TEXT
 --==============================================================================
 
 /*
-ANTI-PATTERN 1: Embedding de documento inteiro de 50k chars
-  - Modelo trunca em 512 tokens, perde 90% do conteúdo
-  - Use chunking obrigatoriamente para documentos > 1000 caracteres
+ANTI-PATTERN 1: Embedding de documento inteiro de 50k caracteres
+  - Tudo que passa do limite de tokens do modelo fica fora do vetor (ou a
+    chamada falha, conforme o modelo/provedor); UTL_TO_EMBEDDING aceita no
+    máximo 4000 caracteres por entrada
+  - Faça chunking para qualquer documento maior que o limite do modelo
 
 ANTI-PATTERN 2: Chunks sem overlap
   - Frases na borda perdem contexto
-  - overlap = 10-20% do max é típico
+  - A faixa aceita é 5% a 20% de max; 10% é um bom ponto de partida
 
 ANTI-PATTERN 3: Reprocessar TODO o corpus quando 1 doc muda
   -- RUIM
@@ -253,14 +348,23 @@ ANTI-PATTERN 3: Reprocessar TODO o corpus quando 1 doc muda
 
   -- BOM: incremental
   DELETE FROM chunks_documentos WHERE id_documento = :id_modificado;
-  -- e re-processa só esse
+  -- e reprocessa só esse
 
 ANTI-PATTERN 4: Não validar dimensão do modelo
-  -- Tabela criada com VECTOR(384, FLOAT32) mas usar modelo de 768-dim falha
-  SELECT VECTOR_EMBEDDING(modelo_768 USING 'teste' AS data) FROM dual;
-  -- ORA-22849: vector dimensions mismatch
+  -- Tabela criada com VECTOR(384, FLOAT32) e modelo de 768 dimensões:
+  INSERT INTO chunks_documentos (id_documento, num_chunk, embedding)
+  VALUES (1, 1, VECTOR_EMBEDDING(modelo_768 USING 'teste' AS data));
+  -- ORA-51803: Vector dimension count must match the dimension count
+  --            specified in the column definition
+  -- E comparar vetores de dimensões diferentes em VECTOR_DISTANCE gera
+  -- ORA-51808. Vetores de modelos diferentes não são comparáveis mesmo
+  -- quando a dimensão coincide.
 
 ANTI-PATTERN 5: Embedding de campos identificadores (CPF, código)
   -- Embedding semântico de '12345678900' não traz valor — use índice B-tree
   -- Use vector apenas em campos com semântica (texto, descrição)
+
+ANTI-PATTERN 6: Nome de modelo concatenado sem validação em SQL dinâmico
+  -- VECTOR_EMBEDDING exige o nome do modelo como identificador: valide com
+  -- DBMS_ASSERT.SIMPLE_SQL_NAME (como no package acima)
 */

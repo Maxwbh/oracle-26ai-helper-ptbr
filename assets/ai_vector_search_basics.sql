@@ -2,44 +2,77 @@
 -- Template: AI Vector Search — Fundamentos
 --
 -- Cobre: VECTOR data type, carregar modelo ONNX, gerar embeddings,
---        similarity search (exhaustive), métricas de distance.
+--        similarity search (exata, sem índice), métricas de distância.
 --
--- Pré-requisito: Oracle 23ai+ ou 26ai (banner mostra "AI Database").
---                Em 19c não funciona — features novas exclusivas.
+-- Pré-requisito: Oracle AI Database 26ai (banner mostra "AI Database").
+--                Em 19c não funciona — VECTOR e VECTOR_EMBEDDING não existem.
+--
+-- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Edição Free: Parcial — VECTOR, ONNX e busca exata cabem no Free, mas o guia
+--              de licenciamento não cita Vector Search explicitamente para o
+--              Free (OML/ONNX sem custo extra) e o limite de 2 GB de RAM
+--              restringe o tamanho do modelo e do vector pool.
+--
+-- Ver também (suíte https://github.com/Maxwbh/oracle-skills-ptbr):
+--   oracle-lab-ptbr   → montar o 26ai Free local para testar este template
+--   oracle-plsql-ptbr → PL/SQL 19c (o que NÃO é específico de 26ai)
 --
 -- Verificação inicial obrigatória:
 --   SELECT banner_full FROM v$version;
---   -- Espera: "Oracle AI Database 26ai Enterprise Edition Release 23.26.x.x.x"
+--   -- Espera: "Oracle AI Database 26ai ... Release 23.26.x.x.x"
 --==============================================================================
 
 
 --==============================================================================
--- 1. Setup: alocar Vector Memory Pool (uma vez, como SYS)
+-- 1. Setup: Vector Pool (como SYS) — só é necessário para índices vetoriais
 --
--- Sem isso, HNSW disputa shared pool e causa ORA-04031.
+-- Busca exata (seção 6) NÃO usa o vector pool. Ele é exigido para criar
+-- índices HNSW (o grafo fica inteiro no pool) e acelera criação/DML de IVF
+-- (centróides em cache; se faltar espaço, vão para o large pool).
+--
+-- VECTOR_MEMORY_SIZE é DINÂMICO — não precisa reiniciar a instância:
+--   - no CDB: tamanho do vector pool da instância (reduzir falha se houver uso)
+--   - no PDB: cota máxima de uso do pool por aquele PDB
 --==============================================================================
 
--- Sizing rule:
---   bytes ≈ dimensoes × 4 (FLOAT32) × num_linhas × 1.3 (overhead grafo)
--- Exemplo: 1536-dim, 10M linhas → 80 GB
--- Exemplo: 384-dim, 100k linhas → 200 MB
-ALTER SYSTEM SET vector_memory_size = 512M SCOPE = SPFILE;
+-- 26ai
+-- Regra de sizing para HNSW (fórmula da doc Oracle):
+--   bytes ≈ 1,3 × num_vetores × dimensoes × bytes_por_dimensao (FLOAT32 = 4)
+-- Exemplo: 1536-dim, 10M linhas → ~80 GB
+-- Exemplo: 384-dim, 100k linhas  → ~200 MB
+-- Para uma estimativa calculada pelo próprio banco, use
+-- DBMS_VECTOR.INDEX_VECTOR_MEMORY_ADVISOR (ver ai_vector_index_strategies.sql).
 
--- Restart obrigatório
-SHUTDOWN IMMEDIATE;
-STARTUP;
+-- Confirmar que pode ser alterado no PDB
+SELECT name, ispdb_modifiable
+  FROM v$system_parameter
+ WHERE name = 'vector_memory_size';
+
+-- Conectado no PDB (define a cota do PDB) — vale na hora e persiste no SPFILE
+ALTER SYSTEM SET vector_memory_size = 512M SCOPE = BOTH;
+
+-- 26ai (23ai 23.8+): alternativa de pool auto-gerenciado —
+-- VECTOR_MEMORY_SIZE = 1 no CDB com SGA_TARGET > 0 na inicialização faz o pool
+-- crescer sob demanda na criação de HNSW (máx. 70% do SGA_TARGET do PDB).
+-- Nesse modo o crescimento não é persistido no SPFILE.
 
 -- Confirmar
 SELECT name, value
   FROM v$parameter
  WHERE name = 'vector_memory_size';
 
+-- 26ai — monitorar o pool (ALLOC_BYTES fica 0 até existir um índice HNSW)
+SELECT con_id, pool,
+       alloc_bytes / 1024 / 1024 AS alloc_mb,
+       used_bytes  / 1024 / 1024 AS used_mb
+  FROM v$vector_memory_pool
+ ORDER BY con_id, pool;
+
 
 --==============================================================================
--- 2. Setup do schema de exploração (executar uma vez)
+-- 2. Setup do schema de exploração (executar uma vez, como SYS no PDB)
 --==============================================================================
 
--- Como SYS no PDB de desenvolvimento
 CREATE BIGFILE TABLESPACE tbs_vector DATAFILE SIZE 256M AUTOEXTEND ON MAXSIZE 2G;
 
 CREATE USER usuario_vetor IDENTIFIED BY "Oracle_4U_dev"
@@ -47,11 +80,10 @@ CREATE USER usuario_vetor IDENTIFIED BY "Oracle_4U_dev"
   TEMPORARY TABLESPACE TEMP
   QUOTA UNLIMITED ON tbs_vector;
 
-GRANT CREATE SESSION, CREATE TABLE, CREATE PROCEDURE TO usuario_vetor;
-GRANT CREATE MINING MODEL TO usuario_vetor;
-GRANT DB_DEVELOPER_ROLE TO usuario_vetor;  -- role nova em 23ai
+GRANT DB_DEVELOPER_ROLE TO usuario_vetor;      -- 26ai (23ai)
+GRANT CREATE MINING MODEL TO usuario_vetor;    -- exigido para LOAD_ONNX_MODEL
 
--- Diretório para carregar modelo ONNX
+-- Diretório (no servidor do banco) de onde o modelo ONNX será lido
 CREATE OR REPLACE DIRECTORY dir_modelos AS '/home/oracle/embedding_models';
 GRANT READ, WRITE ON DIRECTORY dir_modelos TO usuario_vetor;
 
@@ -59,13 +91,18 @@ GRANT READ, WRITE ON DIRECTORY dir_modelos TO usuario_vetor;
 --==============================================================================
 -- 3. Carregar modelo ONNX no banco
 --
--- Pré-requisito: baixar modelo all-MiniLM-L12-v2 (ou similar) de
---   https://huggingface.co/sentence-transformers/all-MiniLM-L12-v2
--- e converter para ONNX (Oracle fornece versão pré-convertida em
---   https://blogs.oracle.com/database/post/embedding-model-onnx-import).
+-- Opções para obter o arquivo .onnx:
+--   a) Modelo pré-construído all-MiniLM-L12-v2 que a Oracle disponibiliza
+--      (all-MiniLM-L12-v2_augmented.zip → all_MiniLM_L12_v2.onnx) — o link
+--      está em "SQL Quick Start Using a Vector Embedding Model Uploaded into
+--      the Database", AI Vector Search User's Guide 26ai.
+--   b) Converter um modelo Hugging Face com OML4Py — ver "Convert Pretrained
+--      Models to ONNX Model: End-to-End Instructions" no mesmo guia.
 --==============================================================================
 
--- Como usuario_vetor:
+-- 26ai — como usuario_vetor
+-- Modelos convertidos pelo OML4Py (como o pré-construído) já trazem a
+-- convenção de entrada/saída e dispensam o parâmetro metadata.
 BEGIN
   DBMS_VECTOR.LOAD_ONNX_MODEL(
     directory   => 'DIR_MODELOS',
@@ -75,7 +112,7 @@ BEGIN
 END;
 /
 
--- Verificar carregamento
+-- Verificar carregamento (ALGORITHM = ONNX, MINING_FUNCTION = EMBEDDING)
 SELECT model_name, algorithm, mining_function
   FROM user_mining_models
  WHERE model_name = 'MODELO_MINILM_L12';
@@ -84,13 +121,16 @@ SELECT model_name, algorithm, mining_function
 --==============================================================================
 -- 4. Tabela com coluna VECTOR
 --
--- Sintaxe: VECTOR(dimensoes, FORMATO)
---   - dimensoes: número fixo (384, 768, 1536) ou * (qualquer)
---   - formato: FLOAT32, FLOAT64, INT8, BINARY
+-- Sintaxe: VECTOR(dimensoes, formato [, DENSE | SPARSE])
+--   - dimensoes: número fixo (1 a 65535) ou * (flexível)
+--   - formato:   INT8, FLOAT32, FLOAT64, BINARY (BINARY: dimensão múltipla de 8)
+--   - SPARSE (23ai 23.6+, COMPATIBLE >= 23.6.0): só valores não-zero gravados;
+--     índice IVF não suporta SPARSE (HNSW suporta a partir de 23.9)
 --
 -- all-MiniLM-L12-v2 produz vetores de 384 dimensões em FLOAT32.
 --==============================================================================
 
+-- 26ai
 CREATE TABLE documentos_forenses (
   id              NUMBER PRIMARY KEY,
   titulo          VARCHAR2(200),
@@ -105,7 +145,7 @@ CREATE TABLE documentos_forenses (
 -- 5. Popular embeddings — DML único (princípio Tim Hall)
 --==============================================================================
 
--- Inserir documentos com embedding gerado em SQL puro
+-- 26ai — inserir documento com embedding gerado em SQL puro
 INSERT INTO documentos_forenses (id, titulo, conteudo, categoria, embedding)
 VALUES (
   1,
@@ -116,7 +156,9 @@ VALUES (
     'Vítima do sexo masculino, 45 anos, óbito por trauma craniano contuso' AS data)
 );
 
--- Bulk: gerar embeddings para múltiplas linhas (SQL puro)
+-- 26ai — bulk: gerar embeddings para múltiplas linhas (SQL puro)
+-- Para textos longos, fatie antes (ver ai_vector_embedding_pipeline.sql):
+-- o modelo só "enxerga" até o seu limite de tokens.
 INSERT INTO documentos_forenses (id, titulo, conteudo, categoria, embedding)
 SELECT id_origem,
        titulo_origem,
@@ -130,16 +172,20 @@ COMMIT;
 
 
 --==============================================================================
--- 6. Similarity search EXHAUSTIVE (sem índice)
+-- 6. Similarity search EXATA (sem índice)
 --
--- Calcula distance contra TODAS as linhas. OK para datasets pequenos
--- (<10k linhas) ou exploração. Para produção, use índice (próximos templates).
+-- Calcula a distância contra TODAS as linhas. OK para datasets pequenos ou
+-- exploração. Para volume maior, use índice (ai_vector_index_strategies.sql).
 --==============================================================================
 
--- Métricas disponíveis: COSINE, EUCLIDEAN, DOT, MANHATTAN, HAMMING
--- Mais comum em texto: COSINE (independe de magnitude)
+-- Métricas: COSINE (default), DOT, EUCLIDEAN, EUCLIDEAN_SQUARED (= L2_SQUARED),
+--           MANHATTAN, HAMMING, JACCARD (só vetores BINARY)
+-- Atalhos: COSINE_DISTANCE, L1_DISTANCE, L2_DISTANCE, INNER_PRODUCT,
+--          HAMMING_DISTANCE, JACCARD_DISTANCE; operadores <=> (cosine),
+--          <-> (euclidiana), <#> (dot negativo).
+-- Mais comum em texto: COSINE (independe da magnitude).
 
--- Top 5 mais similares a uma busca textual
+-- 26ai — top 5 mais similares a uma busca textual
 SELECT id, titulo, categoria,
        VECTOR_DISTANCE(
          embedding,
@@ -151,11 +197,11 @@ SELECT id, titulo, categoria,
  FETCH FIRST 5 ROWS ONLY;
 
 
--- Query parametrizada com bind variable (recomendado em produção)
+-- 26ai — query com variáveis PL/SQL (viram bind variables)
 DECLARE
   l_busca         VARCHAR2(500) := 'morte por arma de fogo';
-  l_limite        PLS_INTEGER := 5;
-  CURSOR co_resultados IS
+  l_limite        PLS_INTEGER   := 5;
+  CURSOR c_resultados IS
     SELECT id, titulo, categoria,
            VECTOR_DISTANCE(
              embedding,
@@ -166,9 +212,10 @@ DECLARE
      ORDER BY distancia
      FETCH FIRST l_limite ROWS ONLY;
 BEGIN
-  FOR r IN co_resultados LOOP
+  FOR r_resultado IN c_resultados LOOP
     DBMS_OUTPUT.put_line(
-      r.id || ' | ' || r.titulo || ' | dist=' || ROUND(r.distancia, 4)
+      r_resultado.id || ' | ' || r_resultado.titulo ||
+      ' | dist=' || ROUND(r_resultado.distancia, 4)
     );
   END LOOP;
 END;
@@ -179,22 +226,28 @@ END;
 -- 7. Comparar dois embeddings diretamente
 --==============================================================================
 
+-- 26ai — VECTOR_EMBEDDING é função SQL; em PL/SQL use SELECT ... INTO
 DECLARE
   l_emb_a VECTOR;
   l_emb_b VECTOR;
   l_dist  NUMBER;
 BEGIN
-  l_emb_a := VECTOR_EMBEDDING(modelo_minilm_l12 USING 'óbito por arma de fogo' AS data);
-  l_emb_b := VECTOR_EMBEDDING(modelo_minilm_l12 USING 'morte por disparo' AS data);
+  SELECT VECTOR_EMBEDDING(modelo_minilm_l12 USING 'óbito por arma de fogo' AS data),
+         VECTOR_EMBEDDING(modelo_minilm_l12 USING 'morte por disparo' AS data)
+    INTO l_emb_a, l_emb_b
+    FROM dual;
 
   l_dist := VECTOR_DISTANCE(l_emb_a, l_emb_b, COSINE);
-  DBMS_OUTPUT.put_line('Distance COSINE: ' || ROUND(l_dist, 4));
+  DBMS_OUTPUT.put_line('Distância COSINE: ' || ROUND(l_dist, 4));
   -- Espera valor baixo (próximo de 0) — frases semanticamente próximas
 
-  l_emb_b := VECTOR_EMBEDDING(modelo_minilm_l12 USING 'receita de bolo de chocolate' AS data);
+  SELECT VECTOR_EMBEDDING(modelo_minilm_l12 USING 'receita de bolo de chocolate' AS data)
+    INTO l_emb_b
+    FROM dual;
+
   l_dist := VECTOR_DISTANCE(l_emb_a, l_emb_b, COSINE);
-  DBMS_OUTPUT.put_line('Distance COSINE (descorrelacionado): ' || ROUND(l_dist, 4));
-  -- Espera valor alto — frases não relacionadas
+  DBMS_OUTPUT.put_line('Distância COSINE (não relacionado): ' || ROUND(l_dist, 4));
+  -- Espera valor maior — frases não relacionadas
 END;
 /
 
@@ -203,11 +256,14 @@ END;
 -- 8. Inspeção da coluna VECTOR
 --==============================================================================
 
--- Tamanho em bytes (dimensoes × 4 para FLOAT32)
+-- 26ai — armazenamento ≈ dimensoes × bytes do formato (FLOAT32 = 4 bytes)
+-- Obs.: VECTOR_SERIALIZE devolve a forma TEXTUAL ('[0.1,...]'); o tamanho dela
+-- não é o tamanho em disco e, para 384 floats, pode passar de 4000 bytes
+-- (use RETURNING CLOB se precisar serializar).
 SELECT id,
-       LENGTH(VECTOR_SERIALIZE(embedding)) AS tamanho_serializado,
-       VECTOR_DIMENSION_COUNT(embedding) AS dimensoes,
-       VECTOR_NORM(embedding) AS norma
+       VECTOR_DIMENSION_COUNT(embedding)  AS dimensoes,
+       VECTOR_DIMENSION_FORMAT(embedding) AS formato,
+       VECTOR_NORM(embedding)             AS norma
   FROM documentos_forenses
  WHERE id <= 3;
 
@@ -218,7 +274,8 @@ SELECT id,
 
 /*
 ANTI-PATTERN 1: Armazenar embeddings em VARCHAR2/CLOB como string
-  -- RUIM: '[0.1, 0.2, 0.3, ...]' ocupa 5x mais espaço, não tem índice
+  -- RUIM: '[0.1, 0.2, 0.3, ...]' ocupa mais espaço, exige conversão e
+  --       não aceita índice vetorial
   embedding_text CLOB
 
   -- BOM:
@@ -233,28 +290,31 @@ ANTI-PATTERN 2: Loop PL/SQL gerando embeddings linha-a-linha
   -- BOM: INSERT SELECT em DML único
   INSERT INTO destino SELECT id, ..., VECTOR_EMBEDDING(...) FROM origem;
 
-ANTI-PATTERN 3: FETCH FIRST sem APPROX em query indexada
-  -- RUIM (com índice HNSW criado): não usa o índice
+ANTI-PATTERN 3: FETCH FIRST sem APPROX em query que deveria usar índice
+  -- RUIM (on-premises, com índice criado): faz busca EXATA
   ORDER BY VECTOR_DISTANCE(...) FETCH FIRST 10 ROWS ONLY
 
   -- BOM: explicita aproximação para usar o índice
   ORDER BY VECTOR_DISTANCE(...) FETCH APPROX FIRST 10 ROWS ONLY
+  -- (Só no Autonomous Serverless o APPROX é tentado mesmo se omitido.)
 
-ANTI-PATTERN 4: Misturar métricas de distance entre índice e query
-  -- Índice criado com COSINE; query usa EUCLIDEAN → ignora índice
-  -- Sempre use a MESMA métrica do índice na query
+ANTI-PATTERN 4: Métrica da query diferente da métrica do índice
+  -- Índice criado com COSINE; query usa EUCLIDEAN → índice não é usado
+  -- Use a MESMA métrica, ou omita a métrica na query (VECTOR_DISTANCE herda
+  -- a métrica do índice da coluna quando há um único índice vetorial).
 
 ANTI-PATTERN 5: Logar vetor inteiro em Logger
-  logger.append_param(l_params, 'embedding', l_vetor); -- 384 floats poluição
+  logger.append_param(l_params, 'embedding', l_vetor); -- 384 floats de ruído
 
   -- BOM: log dimensão e norma
   logger.append_param(l_params, 'dim', VECTOR_DIMENSION_COUNT(l_vetor));
   logger.append_param(l_params, 'norma', VECTOR_NORM(l_vetor));
 
-ANTI-PATTERN 6: Modelo ONNX errado para o caso de uso
-  -- all-MiniLM-L12-v2: 384-dim, ótimo para texto curto, multilíngue parcial
-  -- text-embedding-3-large (OpenAI): 3072-dim, alta qualidade, custo
-  -- E5-large-v2: 1024-dim, multilíngue, open
-  -- BGE-large: 1024-dim, performance forte em pt-br
-  -- Para PT-BR forense, BGE-m3 ou multilingual-e5 são opções superiores
+ANTI-PATTERN 6: Modelo de embedding escolhido sem avaliar o caso de uso
+  -- all-MiniLM-L12-v2 (384-dim): leve, bom ponto de partida, foco em inglês
+  -- Para PT-BR, avalie modelos multilíngues (ex.: famílias E5 multilíngue,
+  -- BGE-M3) convertidos para ONNX, ou um provedor externo.
+  -- Dimensões e limites de tokens: confira no model card de cada modelo
+  -- antes de definir VECTOR(n, ...) — não estão na doc Oracle.
+  -- Meça a qualidade com um conjunto de perguntas reais antes de decidir.
 */
