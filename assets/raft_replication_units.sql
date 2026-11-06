@@ -1,11 +1,23 @@
 --==============================================================================
--- Template: RAFT Replication Units — Detalhes (EXPLORATÓRIO)
+-- Template: Raft Replication Units — Detalhes (EXPLORATÓRIO)
 --
--- Cobre: criação, configuração, e operações com Replication Units (RUs)
--- num cluster RAFT.
+-- Cobre: anatomia da Replication Unit (RU), comandos GDSCTL reais para RUs,
+-- distribuição de chunks, parâmetros por RU e monitoração em SQL.
 --
--- Este é template de referência conceitual. Comandos requerem ambiente
--- multi-shard configurado.
+-- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Demonstrativo — exige topologia RAFT implantada
+-- RU mínimo: 23.26.0; REPLICA_TYPE em V$SHARD_REPLICATION_UNIT 23.26.1+
+-- Edição Free: Sim — o Licensing Guide 26ai permite Raft Replication no Free
+--              com até 3 nós (2 CPUs, 2 GB RAM, 12 GB de dados por nó)
+--
+-- Referência conceitual. Os comandos exigem um banco distribuído com
+-- Raft habilitado (create shardcatalog ... -repl native) e já com DEPLOY.
+--
+-- Fontes: shard/raft-replication-concepts.html,
+--         shard/raft-replication-operations.html,
+--         gsctl/{status-ru, switchover-ru, move-ru, copy-ru, relocate-chunk,
+--                remove-ru, start-ru, stop-ru, sync-ru}.html,
+--         refrn/V-SHARD_REPLICATION_UNIT.html, refrn/SHARD_RAFT_PARAMETERS.html
 --==============================================================================
 
 
@@ -14,65 +26,91 @@
 --==============================================================================
 
 /*
-Cada RU é composta por:
+RU = conjunto de chunks com a mesma topologia de replicação (um chunk set).
+Cada RU forma um Raft group:
 
-  - 1 LEADER (replica primária, aceita writes)
-  - N FOLLOWERS (replicas secundárias, aceitam reads se configurado)
-  - QUORUM = floor(N/2) + 1 (writes só commitam com quorum confirmado)
+  - 1 LEADER: recebe a DML desse subconjunto de dados
+  - FOLLOWERS: recebem o Raft log do leader
+  - RF (replication factor) = 3 no Oracle Globally Distributed AI Database
+    (limite atual, igual para todas as RUs) → precisa de maioria (2 de 3)
+    para escrever; tolera 1 réplica indisponível.
 
-Exemplo com replication_factor = 3:
+Exemplo com RF = 3:
   +----------+   +----------+   +----------+
-  | LEADER   |--→| FOLLOWER |   | FOLLOWER |
-  | (shard1) |   | (shard2) |   | (shard3) |
+  | LEADER   |-->| FOLLOWER |   | FOLLOWER |
+  | (shard1) |-->| (shard2) |   | (shard3) |
   +----------+   +----------+   +----------+
-       ↓             ↓               ↓
-  Write recebido    Replica         Replica
-  COMMIT só após    confirma        confirma
-  2 confirmações
-  (quorum)
+  O commit é confirmado no leader quando metade dos followers grava o
+  registro de commit no Raft log (consenso → zero data loss). A aplicação
+  das mudanças nos followers é assíncrona.
 
-Failover:
-  Se LEADER falha, FOLLOWERS elegem novo leader (algoritmo RAFT).
-  Eleição leva tipicamente 2-5 segundos.
-  Cliente reconecta automaticamente via GSM.
+Cada shard é leader de algumas RUs e follower de outras (padrão: leader de
+2 e follower de 4), mantendo todos os shards ativos.
+
+Failover: sem heartbeat do leader (padrão 150 ms + timeout aleatório de até
+150 ms), os followers elegem novo leader. Tempo documentado: < 3 s com
+latência < 10 ms entre zonas, incluindo reconexão da aplicação (clientes
+notificados via ONS/FAN).
 */
 
 
 --==============================================================================
--- 2. Comandos GDSCTL para RUs
+-- 2. Comandos GDSCTL para RUs (somente os documentados)
 --==============================================================================
 
 /*
-$ gdsctl connect gsmadmin/<senha>@gsm1
+NÃO EXISTEM: add ru, config ru, failover ru, add replica, remove replica,
+set ru priority, opções -replicas / -newleader / -priority / -max_lag /
+-read_local. As RUs são criadas no DEPLOY (quantidade padrão decidida no
+primeiro DEPLOY, ou definida antes dele com -repunits — ver
+raft_setup_overview.sql).
 
-# Criar RU com 3 replicas
-GDSCTL> add ru -name ru_principal \
-               -replicas 3 \
-               -shardgroup sg_brasil
+$ gdsctl
+GDSCTL> connect <admin>@<catalogo>        -- ou rodar no home do shard director
 
-# Listar todas as RUs
-GDSCTL> config ru
-   RU Name              Status   Replicas   Shardgroup
-   ru_principal   ONLINE   3          sg_brasil
+# Situação das RUs (também: "status replication" ou só "ru")
+GDSCTL> status ru
+GDSCTL> status ru -ru 1
+GDSCTL> status ru -leaders
+GDSCTL> status ru -sort -show_chunks
+GDSCTL> status ru -database <shard> -show_errors
+  -- Saída: Database, RU#, Role (Leader/Follower), Term, Log Index, Status
+  --        e, conforme a versão/opções, Apply/LWM/On-disk index.
 
-# Detalhes de uma RU específica
-GDSCTL> config ru ru_principal
-   Leader: shard1.example.local
-   Followers:
-     - shard2.example.local (lag: 0ms, status: SYNCED)
-     - shard3.example.local (lag: 12ms, status: SYNCED)
+# Trocar o leader de uma RU (manutenção planejada)
+GDSCTL> switchover ru -ru 1 -database <shard_destino>
+  -- A VERIFICAR: o guia shard mostra "-shard"; a referência gsctl, "-database".
 
-# Forçar troca de leader (manutenção planejada)
-GDSCTL> switchover ru ru_principal -newleader shard2
+# Redistribuir leaders igualmente entre shards
+GDSCTL> switchover ru -rebalance
 
-# Adicionar mais um follower
-GDSCTL> add replica ru_principal -shard shard4
+# Mover uma réplica FOLLOWER para outro shard
+#   (origem não pode ser o leader; destino não pode já ter réplica da RU)
+GDSCTL> move ru -ru 1 -source <shard_a> -target <shard_b>
 
-# Remover follower (reduzir replicas)
-GDSCTL> remove replica ru_principal -shard shard3
+# Instanciar/reparar um follower copiando de outro follower
+#   (nem origem nem destino podem ser o leader; exige ao menos 1 tablespace set)
+GDSCTL> copy ru -ru 1 -source <shard_a> -target <shard_b>
+GDSCTL> copy ru -ru 1 -source <shard_a> -target <shard_c> -replace <shard_b>
 
-# Failover forçado (em emergência, leader inacessível)
-GDSCTL> failover ru ru_principal -newleader shard2 -force
+# Mover chunks entre RUs (leaders e followers das duas RUs colocalizados)
+#   MOVE CHUNK não é suportado com Raft — use RELOCATE CHUNK
+GDSCTL> relocate chunk -chunk 3,4 -sourceru 1 -targetru 2
+#   sem -targetru: cria uma RU nova e vazia como destino
+
+# Dividir um chunk dentro da RU
+GDSCTL> split chunk -chunk 3
+
+# Remover RU (precisa estar vazia)
+GDSCTL> remove ru -ru 4
+
+# Parar/retomar uma RU (todas as réplicas ou só a de um shard)
+GDSCTL> stop ru  -ru 1 -database <shard>
+GDSCTL> start ru -ru 1 -database <shard>
+
+# Ressincronizar os membros da RU (apaga Raft logs, zera log index/term;
+#   acompanhar com "config task")
+GDSCTL> sync ru -ru 1 -database <shard>
 */
 
 
@@ -80,27 +118,28 @@ GDSCTL> failover ru ru_principal -newleader shard2 -force
 -- 3. Distribuição de tabelas por RU
 --==============================================================================
 
--- Sharded tables são automaticamente distribuídas entre RUs por hash da chave
--- Tabelas duplicated replicam para TODAS as RUs (overhead de write em todas)
+-- Sharded table: partições (chunks) distribuídas entre as RUs pela chave
+ALTER SESSION ENABLE SHARD DDL;
 
--- Sharded: cada partition fica em uma RU diferente
+CREATE TABLESPACE SET tbs_laudos;
+
 CREATE SHARDED TABLE laudos (
-  id_laudo      NUMBER,
+  id_laudo      NUMBER NOT NULL,
   numero_laudo  VARCHAR2(20),
   data_emissao  DATE,
   conteudo      CLOB,
   id_perito     NUMBER,
   CONSTRAINT pk_laudos PRIMARY KEY (id_laudo)
 )
-PARTITION BY CONSISTENT HASH (id_laudo)
-PARTITIONS AUTO
-TABLESPACE SET tbs_laudos;
+TABLESPACE SET tbs_laudos
+PARTITION BY CONSISTENT HASH (id_laudo) PARTITIONS AUTO;
 
--- Resultado: 256 partitions distribuídas entre N RUs
--- Cada partition é uma "chunk" replicada via RAFT
+-- O número de chunks depende da configuração (create shardcatalog -chunks;
+-- sem isso, definido no primeiro DEPLOY). Cada chunk pertence a uma RU.
+-- Ver a distribuição: GDSCTL> status ru -show_chunks
 
 
--- Duplicated: tabelas pequenas de referência, replicam para todos
+-- Tabela duplicada: dados de referência pequenos, copiados em todos os shards
 CREATE DUPLICATED TABLE tipos_laudo (
   codigo  VARCHAR2(10) PRIMARY KEY,
   nome    VARCHAR2(100),
@@ -111,134 +150,128 @@ INSERT INTO tipos_laudo VALUES ('NECRO', 'Necropsia', 'S');
 INSERT INTO tipos_laudo VALUES ('TOXIC', 'Toxicológico', 'S');
 INSERT INTO tipos_laudo VALUES ('GENET', 'Genético', 'S');
 COMMIT;
--- Estes 3 inserts são propagados para TODOS os shards
+-- A VERIFICAR: mecanismo de propagação de tabelas duplicadas quando a
+-- replicação é Raft (não detalhado nas páginas de Raft lidas).
 
 
 --==============================================================================
--- 4. Identificar onde uma row está armazenada
---==============================================================================
-
--- Em catalog connection, ver qual chunk/RU contém um id específico
-SELECT id_laudo, sys_context('USERENV', 'DB_UNIQUE_NAME') AS shard
-  FROM laudos
- WHERE id_laudo = 12345;
-
--- Estatísticas de distribuição
-SELECT chunk_number, num_rows, shard
-  FROM gv$shard_chunks
- WHERE table_name = 'LAUDOS';
-
-
---==============================================================================
--- 5. Configurações importantes da RU
+-- 4. Parâmetros por RU (set ru parameter)
 --==============================================================================
 
 /*
-Parâmetros configuráveis em add ru / modify ru:
+Sintaxe:
+  GDSCTL> set ru parameter <PARAMETRO>=<valor> [-shard <shard>] [-ru <id>]
+  (sem -ru: todas as RUs; sem -shard: todos os shards)
 
-  -replicas N
-    Número de replicas (incluindo leader). Mínimo 3 para quorum válido.
-    
-  -region <region>
-    Região associada à RU. Afeta routing por proximidade.
-    
-  -priority <list>
-    Ordem de preferência para leadership.
-    Útil quando shards têm capacidades diferentes.
-    
-  -max_lag <segundos>
-    Lag máximo aceitável antes de RU ficar OUT_OF_SYNC.
-    
-  -read_local <true/false>
-    Se TRUE, queries SELECT podem usar followers (read scaling).
-    Se FALSE, todas queries vão para leader (consistência forte).
+Parâmetros documentados:
+  SHARD_TXN_ACK_TIMEOUT_SEC
+    Tempo máximo que uma transação espera o consenso do commit antes de
+    ORA-05086. Padrão 90 s; mínimo 1 s.
+      GDSCTL> set ru parameter SHARD_TXN_ACK_TIMEOUT_SEC=10
+
+  SHARD_FLOW_CONTROL = TILL_TIMEOUT (padrão) | AT_DISTANCE | AT_LOGLIMIT
+    Controle de fluxo para follower atrasado.
+  SHARD_FLOW_CONTROL_NS_DISTANCE_PCT     (padrão 10; usado por AT_DISTANCE)
+  SHARD_FLOW_CONTROL_TIMEOUT_MULTIPLIER  (padrão 10 x heartbeat; TILL_TIMEOUT)
+
+Parâmetro de inicialização (não é "set ru parameter"):
+  SHARD_ENABLE_RAFT_FOLLOWER_READ = TRUE | FALSE (padrão FALSE)
+    Habilita leitura nas réplicas follower do shard; modificável por
+    ALTER SYSTEM / ALTER SESSION, também no PDB.
+*/
+
+-- 26ai
+ALTER SESSION SET shard_enable_raft_follower_read = TRUE;
+
+
+--==============================================================================
+-- 5. Monitoração em SQL (no shard)
+--==============================================================================
+
+-- 26ai: papel deste shard em cada RU
+--   ROLE: 1 = leader, 2 = follower, 3 = candidato
+--   COMMITIDX: LCRs com índice <= COMMITIDX têm consenso
+--   APPLYLWMIDX: low watermark de apply no follower
+SELECT ru_id,
+       DECODE(role, 1, 'LEADER', 2, 'FOLLOWER', 3, 'CANDIDATO') AS papel,
+       leader_id, term, commitidx, applylwmidx, ondiskidx,
+       role_changed_time
+  FROM v$shard_replication_unit
+ ORDER BY ru_id;
+
+-- 26ai: distância entre consenso e apply (indício de follower atrasado)
+SELECT ru_id, commitidx - applylwmidx AS indices_pendentes_apply
+  FROM v$shard_replication_unit
+ WHERE role = 2
+ ORDER BY indices_pendentes_apply DESC;
+
+-- 26ai 23.26.1+: tipo de réplica (0 = completa, 1 = witness)
+SELECT ru_id, replica_type
+  FROM v$shard_replication_unit;
+
+-- 26ai: parâmetros definidos por RU
+SELECT ora_shard_id, ru_id, name, value
+  FROM shard_raft_parameters;
+
+-- Demais V$ de Raft: V$SHARD_ACK_SENDER, V$SHARD_ACK_RECEIVER,
+-- V$SHARD_APPLY_*, V$SHARD_LCR_*, V$SHARD_NETWORK_SENDER,
+-- V$SHARD_MESSAGE_TRACKING, V$SHARD_TRANSACTION (colunas no Reference).
+-- A VERIFICAR: não há view documentada de histórico de eleições/switchovers;
+-- use ROLE_CHANGED_TIME e TERM (TERM incrementa a cada novo leader).
+
+
+--==============================================================================
+-- 6. Cenários de operação
+--==============================================================================
+
+/*
+CENÁRIO 1: Manutenção planejada de um shard
+  1. status ru -database <shard>       → RUs em que ele é leader
+  2. switchover ru -ru <id> -database <outro_shard>  (para cada RU leader)
+  3. stop ru -ru <id> -database <shard> se precisar suspender a replicação
+  4. manutenção
+  5. start ru ...; depois switchover ru -rebalance
+
+CENÁRIO 2: Adicionar shards
+  1. add shard -connect ... ; deploy
+  2. Rebalanceamento automático: para cada shard novo, 2 RUs novas com
+     leader nele; chunks movidos de outras RUs. Acompanhar com config task.
+  3. deploy -no_rebalance para mover RUs/chunks manualmente.
+
+CENÁRIO 3: Remover shard
+  1. switchover ru (leaders para outros shards)
+  2. move ru (followers para shards sem réplica daquela RU)
+  3. status ru -database <shard> deve vir vazio
+  4. remove shard / remove cdb / remove invitednode
+  5. opcional: relocate chunk + remove ru das RUs excedentes
+
+CENÁRIO 4: Falha de leader → ver raft_failover_recovery.sql
+  Eleição automática; não existe comando de failover manual de RU.
+
+CENÁRIO 5: Partição de rede
+  Só o lado com maioria do Raft group elege leader e confirma commits;
+  no lado minoritário commits não obtêm consenso (ORA-05086 após
+  SHARD_TXN_ACK_TIMEOUT_SEC).
 */
 
 
 --==============================================================================
--- 6. Monitoring em SQL
---==============================================================================
-
--- Status agregado de todas RUs
-SELECT ru_name, leader_shard, num_followers,
-       num_synced, num_out_of_sync,
-       max_lag_ms
-  FROM gv$ru_status
- ORDER BY max_lag_ms DESC;
-
--- Histórico de switchovers/failovers
-SELECT ru_name, event_type, old_leader, new_leader,
-       event_time, duration_ms
-  FROM dba_ru_events
- WHERE event_time > SYSDATE - 7
- ORDER BY event_time DESC;
-
--- Métricas de write throughput por RU
-SELECT ru_name, 
-       writes_per_sec, reads_per_sec,
-       avg_commit_latency_ms,
-       p99_commit_latency_ms
-  FROM gv$ru_metrics;
-
-
---==============================================================================
--- 7. Cenários de operação
+-- 7. Limitações e considerações
 --==============================================================================
 
 /*
-CENÁRIO 1: Manutenção planejada do leader
-  1. Identificar RU afetada: config ru
-  2. Switchover para outro shard: switchover ru <name> -newleader <shard>
-  3. Verificar nova topologia: config ru
-  4. Aplicar manutenção no shard agora-follower
-  5. Re-adicionar como follower quando voltar
+- Raft só com distribuição system-managed.
+- RF fixo em 3.
+- Número de RUs não muda após o DEPLOY (só por relocate chunk/remove ru,
+  e por rebalanceamento ao adicionar shards).
+- MOVE CHUNK não é suportado: use RELOCATE CHUNK.
+- copy ru / relocate chunk / split chunk exigem ao menos 1 tablespace set.
+- Raft não protege o shard catalog (use Data Guard nele).
+- Réplicas da mesma RU não devem ficar no mesmo rack: add shard ... -rack.
+- Backup é por banco (RMAN em cada shard e no catálogo) — skill
+  oracle-dba-ptbr da suíte https://github.com/Maxwbh/oracle-skills-ptbr
 
-CENÁRIO 2: Adicionar capacidade (mais shards)
-  1. Provisionar novo shard
-  2. add shard -connect ... -shardgroup ...
-  3. Sharded tables automaticamente rebalanceiam
-     (chunks são movidos via RAFT log, sem downtime)
-
-CENÁRIO 3: Falha de leader
-  1. Followers detectam ausência (heartbeat timeout)
-  2. Eleição automática (algoritmo RAFT)
-  3. Quorum dos followers vivos elege novo leader
-  4. Cliente recebe ORA-XXXXX, reconecta via GSM
-  5. Aplicação deve ter retry logic (típico em REST/ORDS)
-
-CENÁRIO 4: Split-brain (partição de rede)
-  - RAFT garante: APENAS o lado com quorum aceita writes
-  - Lado minoritário fica read-only
-  - Quando partição se resolve, lado minoritário sincroniza com maioria
-*/
-
-
---==============================================================================
--- 8. Limitações e considerações
---==============================================================================
-
-/*
-LIMITAÇÕES:
-  - Nem todos os tipos de objeto são "sharded-friendly":
-    * Sequences distribuídas: usar GENERATED ALWAYS AS IDENTITY consciente de shard
-    * Triggers cross-shard: complicado, geralmente evitar
-    * PL/SQL com cross-shard JOIN: fica lento (network)
-    
-  - Backup é por shard:
-    * RMAN backup individual de cada shard
-    * Recovery point depends de log shipping/RAFT logs
-    
-  - Schema changes:
-    * DDL é propagado via shard catalog
-    * Tempo de propagação aumenta com número de shards
-
-EM PRODUÇÃO:
-  - RAFT em 23.26.x ainda tem refinamentos por release update
-  - Recomenda-se MOS notes atualizadas: "RAFT Replication Best Practices"
-  - Testes de failover devem ser parte do plano de DR
-
-PARA EXPLORAÇÃO TÉCNICA:
-  - Comece com 3 instâncias em VirtualBox ou Docker
-  - Use "Oracle Sharding Lab" do LiveLabs
-  - Não tente em produção sem treinamento dedicado
+PARA EXPLORAÇÃO:
+  - 3 instâncias 26ai Free bastam (limite do Free para Raft: 3 nós).
+  - Ambiente local: skill oracle-lab-ptbr da mesma suíte.
 */

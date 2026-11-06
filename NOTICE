@@ -36,8 +36,20 @@ DBMS_HYBRID_VECTOR, JSON RELATIONAL DUALITY VIEW syntax, and Globally
 Distributed Database commands are based on the official Oracle AI
 Database 26ai documentation:
 - AI Vector Search User's Guide
+- PL/SQL Packages and Types Reference (DBMS_VECTOR, DBMS_VECTOR_CHAIN,
+  DBMS_HYBRID_VECTOR)
 - JSON-Relational Duality Developer's Guide
-- Globally Distributed Database User's Guide
+- Globally Distributed Database Guide and GDSCTL Reference
+- Database Upgrade Guide and Licensing Information User Manual
+- New Features Guide (Release Updates 23.26.0 to 23.26.4)
+
+----------------------------------------------------------------------
+Mike Dietrich
+https://mikedietrichde.com/
+
+Release dates, platform availability, 19c support timelines and
+AutoUpgrade versions cited in the migration material are sourced
+from Mike Dietrich's blog posts.
 
 ----------------------------------------------------------------------
 

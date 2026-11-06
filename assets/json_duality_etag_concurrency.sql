@@ -1,43 +1,63 @@
 --==============================================================================
--- Template: ETag Concurrency Control em Duality Views
+-- Template: Controle de concorrência por ETAG em Duality Views
 --
--- Cobre: padrão optimistic locking via ETag, retry strategies,
---        monitoring de ETag collisions em alta concorrência.
+-- Cobre: controle otimista (lock-free) via _metadata.etag, NOCHECK,
+--        nova tentativa com backoff, registro de conflitos, SYS_ROW_ETAG.
+--
+-- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Executável — depende das tabelas de json_duality_view_basics.sql
+-- RU mínimo: 23.26.0 (qualquer 26ai)
+-- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
+--              para JSON Relational Duality Views na coluna Free
+--
+-- Fontes: jsnvu/using-optimistic-concurrency-control-duality-views.html,
+--         jsnvu/annotation-no-check-include-exclude-fields-etag-calculation.html,
+--         jsnvu/updating-documents-data-duality-views.html
 --
 -- Por que importa:
---   Duality views são acessadas via REST/MongoDB API — operações stateless.
---   Locks tradicionais não funcionam (sessão fecha entre GET e PUT).
---   ETag = hash do conteúdo, garante "ninguém mudou entre meu GET e PUT".
+--   Duality views são muito acessadas via REST/MongoDB API — operações sem
+--   estado. Lock pessimista não atravessa o intervalo GET → PUT.
+--   O ETAG é um hash do conteúdo "checável" do documento: o banco rejeita a
+--   gravação se o conteúdo mudou desde a leitura.
 --==============================================================================
 
 
 --==============================================================================
--- 1. Como ETag é calculado
+-- 1. Como o ETAG é calculado
 --==============================================================================
 
 /*
-ETag é hash do CONTEÚDO da row (e sub-rows incluídas via @link).
-
-Modificação em qualquer campo NÃO marcado @nocheck altera ETag.
-Modificação em campo @nocheck NÃO altera ETag.
+- Por padrão, TODO o conteúdo (payload) do documento entra no cálculo, de
+  todas as tabelas que o compõem (raiz e aninhadas).
+- _metadata (etag, asof) nunca entra no cálculo.
+- Colunas anotadas WITH NOCHECK ficam fora do cálculo. NOCHECK pode ser
+  aplicado na cláusula FROM (vale para a tabela toda) e sobreposto por coluna
+  com WITH CHECK.
+- Colunas identificadoras SEMPRE entram, salvo NOCHECK explícito na coluna.
+- O ETAG é verificado em UPDATE de documento inteiro que traz _metadata.etag.
+  Em update PARCIAL (JSON_TRANSFORM) o etag não é enviado → sem verificação.
+- NOCHECK não faz o campo ser ignorado na gravação: se o update passa, o
+  valor enviado sobrescreve o atual (possível perda silenciosa nesse campo).
 
 Casos de uso:
-  - Campo "audit_timestamp" deve atualizar sem afetar ETag → @nocheck
-  - Campo "versão" do documento deve afetar ETag → default (sem @nocheck)
-  - Sub-array de "histórico" não-essencial → @nocheck no sub-array
+  - campo de auditoria (ex.: ultima_consulta) que muda muito → NOCHECK
+  - dados centrais do documento → padrão (CHECK)
 */
 
--- View com @nocheck seletivo
+-- Coluna de auditoria usada no exemplo
+ALTER TABLE departamentos ADD (ultima_consulta TIMESTAMP);
+
+-- View com NOCHECK seletivo
 CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW departamentos_etag_dv AS
 SELECT JSON {
   '_id'         : d.id_departamento,
   'nome'        : d.nome,
   'localizacao' : d.localizacao,
-  
-  -- Campo de auditoria: muda sem afetar ETag (não bloqueia outros UPDATEs)
+
+  -- Campo de auditoria: muda sem afetar o ETAG
   'ultimaConsulta': d.ultima_consulta WITH NOCHECK,
-  
-  -- Sub-array core: contribui para ETag normalmente
+
+  -- Sub-array central: participa do ETAG normalmente
   'funcionarios': [
     SELECT JSON {
       'idFuncionario': f.id_funcionario,
@@ -52,244 +72,386 @@ SELECT JSON {
 
 
 --==============================================================================
--- 2. Padrão GET → PUT via SQL (simulando o fluxo REST)
+-- 2. Fluxo GET → PUT em SQL (simulando o REST)
 --==============================================================================
 
--- Etapa 1: GET — capture conteúdo + ETag
+-- 26ai
 DECLARE
-  l_dados      CLOB;
-  l_etag       VARCHAR2(100);
+  l_documento JSON;
+  l_etag      VARCHAR2(100);
 BEGIN
-  SELECT data INTO l_dados
-    FROM departamentos_etag_dv
-   WHERE data."_id" = 1;
-  
-  -- Extrai ETag do _metadata
-  SELECT JSON_VALUE(l_dados, '$._metadata.etag')
+  -- GET: documento + ETAG
+  SELECT d.data
+    INTO l_documento
+    FROM departamentos_etag_dv d
+   WHERE d.data."_id" = 1;
+
+  SELECT JSON_VALUE(l_documento, '$._metadata.etag')
     INTO l_etag
     FROM dual;
-  
-  DBMS_OUTPUT.put_line('ETag capturado: ' || l_etag);
-  -- ... aplicação faz alterações no documento ...
-  
-  -- Etapa 2: PUT — envia documento modificado COM o ETag original
-  -- Se outro processo modificou entre GET e PUT, ORA-42699 é lançado
+
+  DBMS_OUTPUT.put_line('ETAG lido: ' || l_etag);
+
+  -- ... a aplicação altera a cópia local (sem mexer em _metadata) ...
+  SELECT JSON_TRANSFORM(l_documento, SET '$.localizacao' = 'Bloco A - Térreo')
+    INTO l_documento
+    FROM dual;
+
+  -- PUT: documento inteiro com o ETAG original; se outro processo alterou
+  -- o conteúdo checável no intervalo → ORA-42699
+  UPDATE departamentos_etag_dv d
+     SET d.data = l_documento
+   WHERE d.data."_id" = 1;
+END;
+/
+
+-- Via REST (ORDS): PUT com o documento (ou cabeçalho If-Match) e etag
+-- divergente → HTTP 412 Precondition Failed. Ver skill oracle-ords-ptbr.
+
+
+--==============================================================================
+-- 3. Package genérico com nova tentativa e backoff exponencial
+--==============================================================================
+
+-- Tabela de registro de conflitos (não há visão de dicionário que conte
+-- ORA-42699; a contagem precisa ser instrumentada pela aplicação)
+CREATE TABLE log_conflitos_etag (
+  id_log        NUMBER GENERATED BY DEFAULT ON NULL AS IDENTITY PRIMARY KEY,
+  nome_view     VARCHAR2(128) NOT NULL,
+  id_documento  NUMBER        NOT NULL,
+  tentativa     NUMBER        NOT NULL,
+  data_registro TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+-- Allowlist: SÓ os pares (view, função) cadastrados aqui podem ser usados
+-- pelo package. Não conceda DML nesta tabela a usuários de aplicação.
+CREATE TABLE cfg_retentativa_etag (
+  nome_view   VARCHAR2(128) NOT NULL,
+  nome_funcao VARCHAR2(128) NOT NULL,
+  CONSTRAINT pk_cfg_retentativa_etag PRIMARY KEY (nome_view, nome_funcao)
+);
+
+-- Exemplo de função modificadora IDEMPOTENTE: calcula o novo documento a
+-- partir do documento ATUAL, sem efeitos colaterais (sem DML, sem sequence,
+-- sem chamada externa). Reaplicá-la após reler o documento é seguro.
+CREATE OR REPLACE FUNCTION definir_localizacao_doc (p_documento IN JSON)
+  RETURN JSON
+IS
+  l_documento JSON;
+BEGIN
+  SELECT JSON_TRANSFORM(p_documento, SET '$.localizacao' = 'Bloco A - Térreo')
+    INTO l_documento
+    FROM dual;
+  RETURN l_documento;
+END definir_localizacao_doc;
+/
+
+INSERT INTO cfg_retentativa_etag (nome_view, nome_funcao)
+VALUES ('DEPARTAMENTOS_ETAG_DV', 'DEFINIR_LOCALIZACAO_DOC');
+COMMIT;
+
+CREATE OR REPLACE PACKAGE concorrencia_duality_pkg
+  AUTHID DEFINER   -- explícito: roda com os privilégios do dono; conceda
+                   -- EXECUTE só ao papel da aplicação que precisa dele
+AS
+  -- Lê o documento, aplica p_funcao_modificar(documento JSON) RETURN JSON e
+  -- grava o documento inteiro; repete em ORA-42699.
+  --
+  -- CONTRATO da função modificadora (obrigatório):
+  --   * idempotente e determinística: o resultado depende só do documento
+  --     recebido (que é RELIDO a cada tentativa);
+  --   * sem efeitos colaterais: sem DML, sequence, chamada externa ou envio
+  --     de mensagem — ela pode rodar várias vezes;
+  --   * o par (view, função) precisa estar em CFG_RETENTATIVA_ETAG.
+  -- Conflitos que exigem decisão humana ou regra de negócio (ex.: dois
+  -- usuários alteraram o mesmo campo com valores diferentes) NÃO devem ser
+  -- resolvidos por retry: chame com p_max_tentativas => 1 e trate o erro
+  -- -20100 no chamador (reler, mostrar a divergência, decidir).
+  --
+  -- Não faz COMMIT: a transação pertence ao chamador.
+  PROCEDURE atualizar_com_retentativa (
+    p_nome_view        IN  VARCHAR2,
+    p_id_documento     IN  NUMBER,
+    p_funcao_modificar IN  VARCHAR2,
+    p_resultado        OUT JSON,
+    p_max_tentativas   IN  PLS_INTEGER DEFAULT 5
+  );
+
+  PROCEDURE relatorio_conflitos (p_horas IN PLS_INTEGER DEFAULT 24);
+END concorrencia_duality_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
+
+  gc_nome_pacote     CONSTANT VARCHAR2(30) := 'CONCORRENCIA_DUALITY_PKG';
+  -- Teto de 5 tentativas, backoff 0,1 s dobrando (0,1+0,2+0,4+0,8 ≈ 1,5 s)
+  gc_max_tentativas  CONSTANT PLS_INTEGER := 5;
+  gc_backoff_inicial CONSTANT NUMBER      := 0.1;  -- segundos
+  gc_backoff_fator   CONSTANT NUMBER      := 2;
+
+
+  PROCEDURE registrar_conflito (
+    p_nome_view    IN VARCHAR2,
+    p_id_documento IN NUMBER,
+    p_tentativa    IN PLS_INTEGER
+  ) IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+  BEGIN
+    INSERT INTO log_conflitos_etag (nome_view, id_documento, tentativa)
+    VALUES (p_nome_view, p_id_documento, p_tentativa);
+    COMMIT;
+  END registrar_conflito;
+
+
+  PROCEDURE atualizar_com_retentativa (
+    p_nome_view        IN  VARCHAR2,
+    p_id_documento     IN  NUMBER,
+    p_funcao_modificar IN  VARCHAR2,
+    p_resultado        OUT JSON,
+    p_max_tentativas   IN  PLS_INTEGER DEFAULT 5
+  ) IS
+    lc_nome_unidade CONSTANT VARCHAR2(60) :=
+      gc_nome_pacote || '.ATUALIZAR_COM_RETENTATIVA';
+
+    l_view_segura     VARCHAR2(128);
+    l_funcao_segura   VARCHAR2(128);
+    l_doc_atual       JSON;
+    l_doc_modificado  JSON;
+    l_tentativa       PLS_INTEGER := 0;
+    l_max_tentativas  PLS_INTEGER := LEAST(GREATEST(NVL(p_max_tentativas, 1), 1),
+                                           gc_max_tentativas);
+    l_autorizado      PLS_INTEGER;
+    l_backoff         NUMBER      := gc_backoff_inicial;
+
+    e_etag_divergente EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_etag_divergente, -42699);
+  BEGIN
+    IF p_nome_view IS NULL OR p_id_documento IS NULL OR p_funcao_modificar IS NULL THEN
+      raise_application_error(-20102,
+        'Parâmetros obrigatórios em ' || lc_nome_unidade);
+    END IF;
+
+    -- Validação dos identificadores (proteção contra SQL injection);
+    -- os valores VALIDADOS é que entram no SQL dinâmico
+    BEGIN
+      l_view_segura   := DBMS_ASSERT.simple_sql_name(p_nome_view);
+      l_funcao_segura := DBMS_ASSERT.simple_sql_name(p_funcao_modificar);
+    EXCEPTION
+      WHEN OTHERS THEN
+        raise_application_error(-20103,
+          'Nome inválido em ' || lc_nome_unidade, TRUE);
+    END;
+
+    -- Allowlist: a FORMA do nome não basta; o par precisa estar autorizado
+    SELECT COUNT(*)
+      INTO l_autorizado
+      FROM cfg_retentativa_etag c
+     WHERE c.nome_view   = UPPER(l_view_segura)
+       AND c.nome_funcao = UPPER(l_funcao_segura);
+
+    IF l_autorizado = 0 THEN
+      raise_application_error(-20105,
+        'Par view/função não autorizado em ' || lc_nome_unidade);
+    END IF;
+
+    <<tentativas>>
+    LOOP
+      l_tentativa := l_tentativa + 1;
+
+      BEGIN
+        -- GET: documento atual com ETAG atual
+        EXECUTE IMMEDIATE
+          'SELECT d.data FROM ' || l_view_segura ||
+          ' d WHERE d.data."_id" = :id_doc'
+          INTO l_doc_atual USING p_id_documento;
+
+        -- Modificação local, fornecida pelo chamador (preserva _metadata)
+        EXECUTE IMMEDIATE
+          'SELECT ' || l_funcao_segura || '(:doc) FROM dual'
+          INTO l_doc_modificado USING l_doc_atual;
+
+        -- PUT: documento inteiro, com o ETAG lido
+        EXECUTE IMMEDIATE
+          'UPDATE ' || l_view_segura ||
+          ' d SET d.data = :doc WHERE d.data."_id" = :id_doc'
+          USING l_doc_modificado, p_id_documento;
+
+        p_resultado := l_doc_modificado;
+        EXIT tentativas;   -- COMMIT fica a cargo do chamador
+
+      EXCEPTION
+        WHEN e_etag_divergente THEN
+          registrar_conflito(l_view_segura, p_id_documento, l_tentativa);
+          IF l_tentativa >= l_max_tentativas THEN
+            raise_application_error(-20100,
+              'Conflito de ETAG não resolvido em ' || lc_nome_unidade ||
+              ' após ' || l_tentativa || ' tentativa(s)', TRUE);
+          END IF;
+          DBMS_SESSION.sleep(l_backoff);
+          l_backoff := l_backoff * gc_backoff_fator;
+      END;
+    END LOOP tentativas;
+  END atualizar_com_retentativa;
+
+
+  PROCEDURE relatorio_conflitos (p_horas IN PLS_INTEGER DEFAULT 24) IS
+  BEGIN
+    DBMS_OUTPUT.put_line('=== Conflitos de ETAG (últimas ' || p_horas || ' h) ===');
+    <<por_documento>>
+    FOR r IN (
+      SELECT nome_view, id_documento, COUNT(*) AS qtd_conflitos
+        FROM log_conflitos_etag
+       WHERE data_registro > SYSTIMESTAMP - NUMTODSINTERVAL(p_horas, 'HOUR')
+       GROUP BY nome_view, id_documento
+       ORDER BY qtd_conflitos DESC
+       FETCH FIRST 20 ROWS ONLY
+    ) LOOP
+      DBMS_OUTPUT.put_line(r.nome_view || ' _id=' || r.id_documento ||
+                           ': ' || r.qtd_conflitos);
+    END LOOP por_documento;
+  END relatorio_conflitos;
+
+END concorrencia_duality_pkg;
+/
+
+-- 26ai — uso: retry automático (função idempotente) e transação do chamador
+DECLARE
+  l_documento JSON;
+BEGIN
+  concorrencia_duality_pkg.atualizar_com_retentativa(
+    p_nome_view        => 'DEPARTAMENTOS_ETAG_DV',
+    p_id_documento     => 1,
+    p_funcao_modificar => 'DEFINIR_LOCALIZACAO_DOC',
+    p_resultado        => l_documento
+  );
+  COMMIT;   -- decisão do chamador
+END;
+/
+
+-- 26ai — uso: conflito devolvido ao chamador (decisão de negócio/humana)
+DECLARE
+  e_conflito_etag EXCEPTION;
+  PRAGMA EXCEPTION_INIT(e_conflito_etag, -20100);
+  l_documento JSON;
+BEGIN
+  concorrencia_duality_pkg.atualizar_com_retentativa(
+    p_nome_view        => 'DEPARTAMENTOS_ETAG_DV',
+    p_id_documento     => 1,
+    p_funcao_modificar => 'DEFINIR_LOCALIZACAO_DOC',
+    p_resultado        => l_documento,
+    p_max_tentativas   => 1
+  );
+  COMMIT;
+EXCEPTION
+  WHEN e_conflito_etag THEN
+    ROLLBACK;
+    -- Releia o documento, apresente a divergência ao usuário e decida
+    RAISE;
 END;
 /
 
 
 --==============================================================================
--- 3. Procedure robusta com retry exponencial
+-- 4. ETAG em tabela (sem duality view): SYS_ROW_ETAG
+--
+-- Calcula o ETAG de uma linha usando SOMENTE as colunas informadas (a ordem
+-- dos argumentos é irrelevante). Permite update relacional lock-free.
 --==============================================================================
 
-CREATE OR REPLACE PACKAGE BODY duality_concurrency_pkg AS
+-- Passo 1: ler o ETAG das colunas que não podem mudar concorrentemente
+SELECT SYS_ROW_ETAG(nome, localizacao) AS etag
+  FROM departamentos
+ WHERE id_departamento = 1;
 
-  gc_nome_pacote CONSTANT VARCHAR2(30) := 'DUALITY_CONCURRENCY_PKG';
-
-  -- Default: 5 tentativas, backoff exponencial até 1.6s
-  gc_max_tentativas    CONSTANT PLS_INTEGER := 5;
-  gc_backoff_inicial   CONSTANT NUMBER := 0.1;  -- segundos
-  gc_backoff_fator     CONSTANT NUMBER := 2;    -- dobra a cada falha
-
-
-  PROCEDURE update_com_retry (
-    p_view_name        IN VARCHAR2,
-    p_id_doc           IN NUMBER,
-    p_funcao_modificar IN VARCHAR2,  -- nome de função que recebe JSON e retorna JSON
-    p_resultado        OUT VARCHAR2
-  ) IS
-    lc_nome_unidade CONSTANT VARCHAR2(60) := gc_nome_pacote || '.update_com_retry';
-    
-    l_doc_atual       CLOB;
-    l_doc_modificado  CLOB;
-    l_etag            VARCHAR2(100);
-    l_tentativa       PLS_INTEGER := 0;
-    l_backoff         NUMBER := gc_backoff_inicial;
-    l_sucesso         BOOLEAN := FALSE;
-    l_sql             VARCHAR2(4000);
-    
-    e_etag_mismatch   EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_etag_mismatch, -42699);
-  BEGIN
-    -- Validação básica
-    IF p_view_name IS NULL OR p_id_doc IS NULL OR p_funcao_modificar IS NULL THEN
-      raise_application_error(-20102,
-        'Parâmetros obrigatórios em ' || lc_nome_unidade
-      );
-    END IF;
-
-    -- Sanitiza nome da view e função (proteção SQL injection)
-    DECLARE
-      l_view_seguro VARCHAR2(128);
-      l_fn_segura   VARCHAR2(128);
-    BEGIN
-      l_view_seguro := DBMS_ASSERT.simple_sql_name(p_view_name);
-      l_fn_segura   := DBMS_ASSERT.simple_sql_name(p_funcao_modificar);
-    EXCEPTION
-      WHEN OTHERS THEN
-        raise_application_error(-20103,
-          'Nome inválido em ' || lc_nome_unidade
-        );
-    END;
-
-    WHILE l_tentativa < gc_max_tentativas AND NOT l_sucesso LOOP
-      l_tentativa := l_tentativa + 1;
-      
-      BEGIN
-        -- GET: re-fetch documento atual com ETag fresh
-        l_sql := 'SELECT data FROM ' || p_view_name ||
-                 ' WHERE data."_id" = :id_doc';
-        EXECUTE IMMEDIATE l_sql INTO l_doc_atual USING p_id_doc;
-        
-        -- Aplica função de modificação fornecida pelo caller
-        l_sql := 'SELECT ' || p_funcao_modificar || '(:doc) FROM dual';
-        EXECUTE IMMEDIATE l_sql INTO l_doc_modificado USING l_doc_atual;
-        
-        -- PUT: tenta atualizar com ETag implícito no l_doc_modificado
-        l_sql := 'UPDATE ' || p_view_name ||
-                 ' SET data = :doc WHERE data."_id" = :id_doc';
-        EXECUTE IMMEDIATE l_sql USING l_doc_modificado, p_id_doc;
-        
-        l_sucesso := TRUE;
-        p_resultado := l_doc_modificado;
-        COMMIT;
-        
-      EXCEPTION
-        WHEN e_etag_mismatch THEN
-          ROLLBACK;
-          IF l_tentativa < gc_max_tentativas THEN
-            DBMS_LOCK.sleep(l_backoff);
-            l_backoff := l_backoff * gc_backoff_fator;  -- exponential backoff
-          ELSE
-            raise_application_error(-20100,
-              'Concorrência excessiva em ' || lc_nome_unidade ||
-              ' após ' || gc_max_tentativas || ' tentativas'
-            );
-          END IF;
-      END;
-    END LOOP;
-  END update_com_retry;
-
-
-  -- Estatísticas: monitorar ETag collisions
-  PROCEDURE relatorio_etag_collisions (
-    p_horas IN PLS_INTEGER DEFAULT 24
-  ) IS
-    l_total_commits   NUMBER;
-    l_total_rollbacks NUMBER;
-    l_taxa_collision  NUMBER;
-  BEGIN
-    -- Métricas approximadas via v$sysstat
-    SELECT MAX(CASE WHEN name = 'user commits' THEN value END),
-           MAX(CASE WHEN name = 'user rollbacks' THEN value END)
-      INTO l_total_commits, l_total_rollbacks
-      FROM v$sysstat
-     WHERE name IN ('user commits', 'user rollbacks');
-    
-    IF NVL(l_total_commits, 0) > 0 THEN
-      l_taxa_collision := ROUND(l_total_rollbacks / l_total_commits * 100, 2);
-    ELSE
-      l_taxa_collision := 0;
-    END IF;
-    
-    DBMS_OUTPUT.put_line('=== Análise de ETag Collisions ===');
-    DBMS_OUTPUT.put_line('Total commits:   ' || l_total_commits);
-    DBMS_OUTPUT.put_line('Total rollbacks: ' || l_total_rollbacks);
-    DBMS_OUTPUT.put_line('Taxa rollback:   ' || l_taxa_collision || '%');
-    
-    IF l_taxa_collision > 5 THEN
-      DBMS_OUTPUT.put_line('ALERTA: taxa alta sugere hot rows ou retry loops em duality views');
-    END IF;
-  END relatorio_etag_collisions;
-
-END duality_concurrency_pkg;
-/
+-- Passo 2: atualizar só se o ETAG ainda for o mesmo (0 linhas = conflito)
+UPDATE departamentos
+   SET localizacao = 'Bloco A - Térreo'
+ WHERE id_departamento = 1
+   AND SYS_ROW_ETAG(nome, localizacao) = :etag_lido;
 
 
 --==============================================================================
--- 4. Identificar hot rows (rows muito disputadas)
+-- 5. Sessões e transações em atividade sobre duality views
 --==============================================================================
 
--- Sessions ativas em UPDATE/DELETE de duality views
+-- Sessões ativas executando UPDATE em views com sufixo _DV (convenção local)
 SELECT s.sid, s.serial#, s.username, s.event,
-       SUBSTR(q.sql_text, 1, 100) AS sql_preview
+       SUBSTR(q.sql_text, 1, 100) AS sql_inicio
   FROM v$session s
-  JOIN v$sql q ON s.sql_id = q.sql_id
+  JOIN v$sql q
+    ON q.sql_id       = s.sql_id
+   AND q.child_number = s.sql_child_number
  WHERE s.status = 'ACTIVE'
-   AND q.sql_text LIKE '%DUALITY%'
-   AND q.sql_text LIKE '%UPDATE%'
+   AND UPPER(q.sql_text) LIKE 'UPDATE%\_DV%' ESCAPE '\'
  ORDER BY s.sid;
 
-
--- Identificar transactions que estão fazendo retry loops
--- (alta atividade de redo + rollback indica padrão problemático)
+-- Transações com mais undo (muitas tentativas desfeitas podem aparecer aqui)
 SELECT s.sid, s.username,
-       t.used_ublk * 8192 AS undo_bytes,
-       t.used_urec AS undo_records
+       t.used_ublk * (SELECT TO_NUMBER(value) FROM v$parameter
+                       WHERE name = 'db_block_size') AS undo_bytes,
+       t.used_urec AS undo_registros
   FROM v$transaction t
   JOIN v$session s ON s.taddr = t.addr
- WHERE s.status = 'ACTIVE'
  ORDER BY t.used_ublk DESC
  FETCH FIRST 10 ROWS ONLY;
 
+-- Diagnóstico de sessões/bloqueios em profundidade: skill oracle-dba-ptbr
+-- da suíte https://github.com/Maxwbh/oracle-skills-ptbr
+
 
 --==============================================================================
--- 5. Estratégias para minimizar ETag collisions
+-- 6. Estratégias para reduzir conflitos de ETAG
 --==============================================================================
 
 /*
-ESTRATÉGIA 1: @nocheck em campos não-críticos
-  - Campo "ultima_consulta" muda 1000x/dia mas não é "core"
-  - Marque com WITH NOCHECK para não disparar collision em UPDATEs paralelos
+ESTRATÉGIA 1: NOCHECK em campos não centrais
+  - "ultima_consulta" muda o tempo todo mas não deve barrar outros updates.
+  - Lembre: o valor enviado ainda sobrescreve o atual se o update passar.
 
-ESTRATÉGIA 2: Granularidade fina nas duality views
-  - View que cobre dept + 100 funcionários = todo UPDATE invalida ETag
-  - Uma view só para dept e outra só para funcionarios = collisions reduzem
+ESTRATÉGIA 2: Views menores por caso de uso
+  - View com departamento + 100 funcionários: qualquer mudança em qualquer
+    funcionário altera o ETAG do documento inteiro.
+  - Views separadas (departamento / funcionário) reduzem conflitos.
 
-ESTRATÉGIA 3: Idempotência na lógica de UPDATE
-  - Se UPDATE seta valor X, segundo UPDATE também setando X é OK
-  - Procedure deve poder ser chamada múltiplas vezes sem efeito colateral
+ESTRATÉGIA 3: Idempotência
+  - A operação deve poder ser repetida sem efeito colateral.
 
-ESTRATÉGIA 4: Backoff exponencial no retry
-  - Inicial: 100ms, dobra a cada falha
-  - 5 tentativas = 100ms + 200 + 400 + 800 + 1600 = ~3s total
-  - Acima disso, repensar arquitetura (hot row)
+ESTRATÉGIA 4: Backoff exponencial
+  - 100 ms dobrando; 5 tentativas ≈ 1,5 s de espera acumulada.
+  - Acima disso, repensar (linha muito disputada).
 
-ESTRATÉGIA 5: Queue assíncrona para hot rows
-  - Em vez de N sessões competindo, enfileirar updates
-  - DBMS_AQ ou tabela de comandos consumida sequencialmente
+ESTRATÉGIA 5: Fila para linhas muito disputadas
+  - Em vez de N sessões competindo, serializar via DBMS_AQ / tabela de comandos.
 
-ESTRATÉGIA 6: Em produção, usar APIs MongoDB ou ORDS REST
-  - Aplicação cliente lida com ETag mais naturalmente em REST
-  - PL/SQL direto é mais propenso a erros de ordering JSON
+ESTRATÉGIA 6: Clientes REST / MongoDB API
+  - O fluxo GET → PUT com etag é natural nessas APIs (412 em conflito).
 */
 
 
 --==============================================================================
--- 6. Anti-patterns ETag
+-- 7. Anti-patterns ETAG
 --==============================================================================
 
 /*
-ANTI-PATTERN 1: Ignorar ORA-42699
-  EXCEPTION WHEN e_etag_mismatch THEN NULL;  -- ERRADO: silently lost update
-  
-  -- BOM: ou retry ou propagar erro
+ANTI-PATTERN 1: Engolir ORA-42699
+  EXCEPTION WHEN e_etag_divergente THEN NULL;  -- ERRADO: lost update silencioso
+  -- BOM: nova tentativa (relendo) ou propagar o erro.
 
-ANTI-PATTERN 2: Hardcode ETag no código
-  -- ERRADO: ETag muda a cada UPDATE
-  l_etag := 'E546E2220E8F9620';  -- vai falhar na 2a chamada
-  
-  -- BOM: re-fetch sempre antes de UPDATE
+ANTI-PATTERN 2: ETAG fixo no código
+  l_etag := '...';  -- ERRADO: o ETAG muda com o conteúdo
+  -- BOM: reler sempre antes de gravar.
 
-ANTI-PATTERN 3: Wrap o UPDATE inteiro num try/catch sem retry
-  - Se ORA-42699 acontece, perder o trabalho não é solução
-  - Use retry com backoff
+ANTI-PATTERN 3: Usar JSON_TRANSFORM direto no UPDATE achando que há
+  controle otimista
+  - Update parcial não envia etag → não há verificação.
 
-ANTI-PATTERN 4: Não monitorar taxa de collisions em produção
-  - Sem visibilidade, hot rows passam despercebidos
-  - Configure alerta se taxa > 5%
+ANTI-PATTERN 4: Não medir conflitos em produção
+  - Instrumente (tabela de log acima) e alerte acima de um limite.
 
-ANTI-PATTERN 5: ETag em sistema single-user
-  - Se app é single-user (1 sessão por vez), ETag traz overhead sem benefício
-  - Considere @nocheck globalmente, ou view sem ETag enforcement
+ANTI-PATTERN 5: ETAG em sistema de um único usuário
+  - Sem concorrência possível, a verificação é custo sem benefício.
+  - Para excluir o documento inteiro do ETAG: NOCHECK em todas as tabelas
+    (ou colunas) E NOCHECK explícito em cada coluna identificadora.
+  - DBMS_JSON_SCHEMA.describe('<VIEW>') indica se a view é verificada
+    (array "properties" contém "check").
 */

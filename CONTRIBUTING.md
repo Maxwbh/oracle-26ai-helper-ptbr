@@ -29,14 +29,11 @@ Se você identificou mudança após release update, abra PR atualizando template
 
 ### 3. Sugerir novos templates ou features cobertas
 
-A skill começou como MVP focado em 3 features. Outras áreas 26ai podem ser cobertas no futuro:
-- Select AI (natural language → SQL)
-- SQL Firewall (compliance/auditoria)
-- True Cache (performance)
-- DBMS_CLOUD nativo
-- Property Graph (continua de 23ai)
-- AI Agents in DB
-- Server-side JavaScript
+A skill é de **aprofundamento** em AI Vector Search, JSON Relational Duality, RAFT e migração 19c → 26ai. Sintaxe nova genérica do 26ai (SQL Firewall, MLE JavaScript, Domains etc.) fica na `oracle-26ai-ptbr` da suíte [oracle-skills-ptbr](https://github.com/Maxwbh/oracle-skills-ptbr). Candidatos a cobertura futura aqui:
+- Select AI / Select AI Agent (on-prem desde 23.26.1)
+- Oracle AI Database Agent Engine (`DBMS_AI_AGENT`)
+- GraphRAG (`DBMS_AI_GRAPHRAG`, 23.26.4+)
+- Property Graph combinado com vetores
 
 Para propor expansão, abra issue descrevendo:
 - Cenário de uso
@@ -97,18 +94,29 @@ ANTI-PATTERN 1: ...
 
 ### Verificações obrigatórias antes de PR
 
+Rode a validação estática (a mesma do CI):
+
+```bash
+python3 .github/scripts/validar_repositorio.py .
+```
+
+
 - Testou o template num ambiente 23ai/26ai real?
-- Documentou versão mínima necessária (alguns features são 23.7+, outros 23.26+)?
+- Marcou o código com `-- 26ai` e a versão mínima quando a feature for de um RU específico (ex.: `-- 26ai 23.26.1+`)?
+- Citou a fonte (docs.oracle.com, oracle-base, mikedietrichde) para cada afirmação de versão ou data?
+- Preencheu no cabeçalho "Revisado", "Tipo", "RU mínimo" e "Edição Free"?
+- Nenhuma senha, token ou chave no script (use `ACCEPT … HIDE`)?
+- Package/procedure reutilizável sem `COMMIT`/`ROLLBACK` (a transação é do chamador)?
 - Adicionou ao `assets/README.md` se for template novo?
 - Atualizou `CHANGELOG.md` com a mudança?
 
 ## O que NÃO é aceito
 
-- PRs com features de 19c ou anteriores (esta skill é só 23ai+/26ai)
+- PRs com features de 19c ou anteriores (vão para a suíte oracle-skills-ptbr)
 - PRs em outras linguagens (Python, Java) — esta skill é exclusivamente PL/SQL/SQL
 - Code dumps massivos sem teste prévio em ambiente Oracle real
 - PRs traduzindo keywords Oracle ou pacotes nativos para PT-BR
-- PRs sobre APEX 26.1 antes do GA (esperar release oficial)
+- PRs sobre APEX (vão para a `oracle-apex-ptbr` da suíte)
 
 ## Código de Conduta
 
