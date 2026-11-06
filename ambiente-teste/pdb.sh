@@ -25,6 +25,9 @@ case "$acao" in
 whenever sqlerror exit failure
 create pluggable database PDB_DOURADO from FREEPDB1
   file_name_convert = ('${BASE}/FREEPDB1/', '${BASE}/PDB_DOURADO/');
+-- PDB recém-criado precisa abrir uma vez em READ WRITE (senão ORA-65085)
+alter pluggable database PDB_DOURADO open;
+alter pluggable database PDB_DOURADO close immediate;
 alter pluggable database PDB_DOURADO open read only;
 alter pluggable database PDB_DOURADO save state;
 exit
@@ -53,4 +56,4 @@ SQL
     ;;
   *) echo "Uso: $0 dourado | novo [NOME] | descartar [NOME] | listar"; exit 1 ;;
 esac
-echo "$acao ${nome}: $(( $(date +%s) - inicio ))s"
+echo "$acao $( [ "$acao" = dourado ] && echo PDB_DOURADO || echo "$nome"): $(( $(date +%s) - inicio ))s"

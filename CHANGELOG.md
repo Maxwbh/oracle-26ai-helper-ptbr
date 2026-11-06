@@ -14,6 +14,7 @@ Teste de integração dos templates no **Oracle AI Database 26ai Free 23.26.3** 
 - `.github/scripts/teste_integracao_local.sh`: sobe o 26ai Free em container, roda os templates de Duality e (com o arquivo ONNX) os de Vector, e resume os erros
 - Validador (`validar_repositorio.py`) passa a barrar as armadilhas de SQL*Plus/SQLcl: `;` seguido de comentário, linha em branco dentro de comando SQL e linha iniciando com `@`
 - Tabela de dados de origem `laudos_origem` em `ai_vector_search_basics.sql` (o INSERT em lote referenciava tabela inexistente)
+- `ambiente-teste/` (fora do pacote): Docker Compose com 26ai Free + ORDS 26.3.1 + APEX 26.2, Vector Pool ligado no startup, pós-instalação (senha do ADMIN do INTERNAL), snapshot dourado (`congelar.sh`/`restaurar.sh`) e PDB descartável clonado de um PDB dourado (`pdb.sh`, `testar.sh`). Medido: restauração em 139 s, stop/start em 55 s e suíte completa num PDB limpo em 30 s, contra ~21 min da primeira instalação
 
 ### Alterado
 - Tabela "funciona no Free?" com resultados medidos (Vector e Duality funcionam no Free 23.26.3; quantização PRODUCT não, por ser 23.26.4+)

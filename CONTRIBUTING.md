@@ -100,7 +100,7 @@ Rode a validação estática (a mesma do CI):
 python3 .github/scripts/validar_repositorio.py .
 ```
 
-E, com Docker, o teste de integração local contra o 26ai Free (imagem `container-registry.oracle.com/database/free:latest`; o arquivo ONNX é opcional e habilita os templates de Vector):
+Com Docker, o caminho recomendado é o ambiente completo em `ambiente-teste/` (26ai Free + ORDS + APEX, snapshot dourado e PDB descartável; a suíte roda em ~30 s): veja `ambiente-teste/README.md`. Alternativa sem compose, o teste de integração local contra o 26ai Free (imagem `container-registry.oracle.com/database/free:latest`; o arquivo ONNX é opcional e habilita os templates de Vector):
 
 ```bash
 .github/scripts/teste_integracao_local.sh caminho/all_MiniLM_L12_v2.onnx

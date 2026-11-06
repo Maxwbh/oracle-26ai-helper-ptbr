@@ -18,7 +18,9 @@ for v in oradata ords_config; do
     --entrypoint bash "$IMG" -c "tar -C /v ${opt} /s/${arq}"
 done
 docker compose up -d
-until [ "$(curl -s -o /dev/null -w '%{http_code}' -L http://127.0.0.1:${ORDS_PORTA:-8080}/ords/apex)" = 200 ]; do
+# O APEX redireciona com cookie de sessão: sem cookie jar o curl entra em loop
+cj=$(mktemp); trap 'rm -f "$cj"' EXIT
+until [ "$(curl -s -c "$cj" -b "$cj" -o /dev/null -w '%{http_code}' -L http://127.0.0.1:${ORDS_PORTA:-8080}/ords/apex)" = 200 ]; do
   sleep 3
   [ $(( $(date +%s) - inicio )) -gt 900 ] && { echo "APEX não respondeu em 15 min"; exit 1; }
 done

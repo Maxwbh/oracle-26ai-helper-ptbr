@@ -124,6 +124,10 @@ oracle-26ai-helper-ptbr/
 | **1.1.0** (nov/2026) | Revisão contra a doc 26ai RU 23.26.4; correção de sintaxe inventada em Vector, Duality e RAFT; tabela Free; ecossistema de IA; integração com a suíte oracle-skills-ptbr. Detalhes em `CHANGELOG.md`. |
 | **v1** (abr/2026) | Versão inicial |
 
+## Ambiente de teste
+
+`ambiente-teste/` sobe 26ai Free + ORDS + APEX em Docker, com snapshot dourado e PDB descartável: a suíte de templates roda num banco limpo em ~30 s. Veja `ambiente-teste/README.md`.
+
 ## Contribuindo
 
 Veja [CONTRIBUTING.md](CONTRIBUTING.md). Issues e PRs são bem-vindos, principalmente sobre mudanças de sintaxe entre RUs do 26ai.
