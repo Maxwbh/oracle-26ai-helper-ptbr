@@ -33,3 +33,9 @@ __pycache__/
 *.pyo
 venv/
 .venv/
+
+# Ambiente de teste (Docker): segredos, binários baixados e snapshots
+ambiente-teste/.env
+ambiente-teste/apex
+ambiente-teste/modelos/
+ambiente-teste/snapshot/
