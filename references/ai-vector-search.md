@@ -87,7 +87,9 @@ CREATE HYBRID VECTOR INDEX idx_doc_hibrido
 
 ### Volume × índice
 
-A doc não traz tabela de corte por volume. Regra prática: HNSW quando o índice cabe no Vector Pool; IVF quando não cabe ou a tabela é particionada. Para estimar memória, use `DBMS_VECTOR.INDEX_VECTOR_MEMORY_ADVISOR` em vez de fórmula fixa.
+A doc não traz tabela de corte por volume. Regra prática: HNSW quando o índice cabe no Vector Pool; IVF quando não cabe ou a tabela é particionada.
+
+Memória do HNSW, pela fórmula da doc ("Size the Vector Pool"): `1.3 × nº de vetores × dimensões × bytes do formato`. Exemplo: 1M vetores × 384 dim × 4 bytes (FLOAT32) × 1.3 ≈ 2 GB. Para estimar com os dados reais, use `DBMS_VECTOR.INDEX_VECTOR_MEMORY_ADVISOR`.
 
 ## Vector Pool (vector_memory_size)
 

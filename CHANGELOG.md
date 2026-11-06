@@ -40,6 +40,11 @@ Revisão completa contra a documentação Oracle AI Database 26ai (RU 23.26.4, o
 - Hybrid vector index (`MODEL … VECTOR_IDXTYPE …`) e `DBMS_HYBRID_VECTOR.SEARCH` (argumento JSON único)
 - `UTL_TO_CHUNKS` (`by` = characters/words/vocabulary), credencial OpenAI (`access_token`), `UTL_TO_GENERATE_TEXT` no lugar de `DBMS_VECTOR.GENERATE` (inexistente)
 - Significado dos erros ORA-42692, ORA-42693, ORA-42624 e ORA-40769; inclusão de ORA-40940 e ORA-42605
+- Erro de dimensão de vetor: ORA-51803 (INSERT) e ORA-51808 (`VECTOR_DISTANCE`) no lugar de ORA-22849
+- `UTL_TO_CHUNKS` retorna `VECTOR_ARRAY_T` de JSON (leitura via `JSON_VALUE`); `UTL_TO_EMBEDDING` é escalar
+- Brechas de SQL injection nos pacotes de pipeline e de retry de ETag (nomes validados com `DBMS_ASSERT` e usados de fato)
+- Packages sem SPEC; prefixo `co_` usado em cursor (Trivadis: `c_`)
+- Views inexistentes `user_vector_indexes` e `v$sgastat 'vector pool'` → `V$VECTOR_INDEX` e `V$VECTOR_MEMORY_POOL`
 - ORDS AutoREST de duality views: 23.1+ (antes 24.1+)
 - RAFT: habilitado por `create shardcatalog -repl native` (default DG); RF fixo 3; heartbeat 150 ms; failover automático; `switchover ru -ru <id> -database <db>`; views `V$SHARD_REPLICATION_UNIT` e `SHARD_RAFT_PARAMETERS`; licença (Free até 3 nós; EE com RAC por shard)
 - `CREATE SHARDED TABLE` com PRIMARY KEY declarada duas vezes
