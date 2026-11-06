@@ -2,6 +2,8 @@
 -- Template: Raft Replication — Visão Geral (EXPLORATÓRIO)
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Demonstrativo — comandos GDSCTL em comentários; exige catálogo, GSM e 3+ shards
+-- RU mínimo: 23.26.0; replicação assíncrona entre regiões 23.26.4+
 -- Edição Free: Sim — o Licensing Guide 26ai permite Raft Replication no Free
 --              com até 3 nós, cada um dentro dos limites do Free
 --              (2 CPUs, 2 GB RAM, 12 GB de dados de usuário)

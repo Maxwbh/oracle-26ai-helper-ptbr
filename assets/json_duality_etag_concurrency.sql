@@ -5,6 +5,8 @@
 --        nova tentativa com backoff, registro de conflitos, SYS_ROW_ETAG.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Executável — depende das tabelas de json_duality_view_basics.sql
+-- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
 --              para JSON Relational Duality Views na coluna Free
 --
@@ -121,14 +123,58 @@ CREATE TABLE log_conflitos_etag (
   data_registro TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL
 );
 
-CREATE OR REPLACE PACKAGE concorrencia_duality_pkg AS
+-- Allowlist: SÓ os pares (view, função) cadastrados aqui podem ser usados
+-- pelo package. Não conceda DML nesta tabela a usuários de aplicação.
+CREATE TABLE cfg_retentativa_etag (
+  nome_view   VARCHAR2(128) NOT NULL,
+  nome_funcao VARCHAR2(128) NOT NULL,
+  CONSTRAINT pk_cfg_retentativa_etag PRIMARY KEY (nome_view, nome_funcao)
+);
+
+-- Exemplo de função modificadora IDEMPOTENTE: calcula o novo documento a
+-- partir do documento ATUAL, sem efeitos colaterais (sem DML, sem sequence,
+-- sem chamada externa). Reaplicá-la após reler o documento é seguro.
+CREATE OR REPLACE FUNCTION definir_localizacao_doc (p_documento IN JSON)
+  RETURN JSON
+IS
+  l_documento JSON;
+BEGIN
+  SELECT JSON_TRANSFORM(p_documento, SET '$.localizacao' = 'Bloco A - Térreo')
+    INTO l_documento
+    FROM dual;
+  RETURN l_documento;
+END definir_localizacao_doc;
+/
+
+INSERT INTO cfg_retentativa_etag (nome_view, nome_funcao)
+VALUES ('DEPARTAMENTOS_ETAG_DV', 'DEFINIR_LOCALIZACAO_DOC');
+COMMIT;
+
+CREATE OR REPLACE PACKAGE concorrencia_duality_pkg
+  AUTHID DEFINER   -- explícito: roda com os privilégios do dono; conceda
+                   -- EXECUTE só ao papel da aplicação que precisa dele
+AS
   -- Lê o documento, aplica p_funcao_modificar(documento JSON) RETURN JSON e
   -- grava o documento inteiro; repete em ORA-42699.
+  --
+  -- CONTRATO da função modificadora (obrigatório):
+  --   * idempotente e determinística: o resultado depende só do documento
+  --     recebido (que é RELIDO a cada tentativa);
+  --   * sem efeitos colaterais: sem DML, sequence, chamada externa ou envio
+  --     de mensagem — ela pode rodar várias vezes;
+  --   * o par (view, função) precisa estar em CFG_RETENTATIVA_ETAG.
+  -- Conflitos que exigem decisão humana ou regra de negócio (ex.: dois
+  -- usuários alteraram o mesmo campo com valores diferentes) NÃO devem ser
+  -- resolvidos por retry: chame com p_max_tentativas => 1 e trate o erro
+  -- -20100 no chamador (reler, mostrar a divergência, decidir).
+  --
+  -- Não faz COMMIT: a transação pertence ao chamador.
   PROCEDURE atualizar_com_retentativa (
     p_nome_view        IN  VARCHAR2,
     p_id_documento     IN  NUMBER,
     p_funcao_modificar IN  VARCHAR2,
-    p_resultado        OUT JSON
+    p_resultado        OUT JSON,
+    p_max_tentativas   IN  PLS_INTEGER DEFAULT 5
   );
 
   PROCEDURE relatorio_conflitos (p_horas IN PLS_INTEGER DEFAULT 24);
@@ -138,7 +184,7 @@ END concorrencia_duality_pkg;
 CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
 
   gc_nome_pacote     CONSTANT VARCHAR2(30) := 'CONCORRENCIA_DUALITY_PKG';
-  -- 5 tentativas, backoff 0,1 s dobrando (0,1+0,2+0,4+0,8 ≈ 1,5 s de espera)
+  -- Teto de 5 tentativas, backoff 0,1 s dobrando (0,1+0,2+0,4+0,8 ≈ 1,5 s)
   gc_max_tentativas  CONSTANT PLS_INTEGER := 5;
   gc_backoff_inicial CONSTANT NUMBER      := 0.1;  -- segundos
   gc_backoff_fator   CONSTANT NUMBER      := 2;
@@ -161,7 +207,8 @@ CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
     p_nome_view        IN  VARCHAR2,
     p_id_documento     IN  NUMBER,
     p_funcao_modificar IN  VARCHAR2,
-    p_resultado        OUT JSON
+    p_resultado        OUT JSON,
+    p_max_tentativas   IN  PLS_INTEGER DEFAULT 5
   ) IS
     lc_nome_unidade CONSTANT VARCHAR2(60) :=
       gc_nome_pacote || '.ATUALIZAR_COM_RETENTATIVA';
@@ -171,6 +218,9 @@ CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
     l_doc_atual       JSON;
     l_doc_modificado  JSON;
     l_tentativa       PLS_INTEGER := 0;
+    l_max_tentativas  PLS_INTEGER := LEAST(GREATEST(NVL(p_max_tentativas, 1), 1),
+                                           gc_max_tentativas);
+    l_autorizado      PLS_INTEGER;
     l_backoff         NUMBER      := gc_backoff_inicial;
 
     e_etag_divergente EXCEPTION;
@@ -191,6 +241,18 @@ CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
         raise_application_error(-20103,
           'Nome inválido em ' || lc_nome_unidade, TRUE);
     END;
+
+    -- Allowlist: a FORMA do nome não basta; o par precisa estar autorizado
+    SELECT COUNT(*)
+      INTO l_autorizado
+      FROM cfg_retentativa_etag c
+     WHERE c.nome_view   = UPPER(l_view_segura)
+       AND c.nome_funcao = UPPER(l_funcao_segura);
+
+    IF l_autorizado = 0 THEN
+      raise_application_error(-20105,
+        'Par view/função não autorizado em ' || lc_nome_unidade);
+    END IF;
 
     <<tentativas>>
     LOOP
@@ -220,10 +282,10 @@ CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
       EXCEPTION
         WHEN e_etag_divergente THEN
           registrar_conflito(l_view_segura, p_id_documento, l_tentativa);
-          IF l_tentativa >= gc_max_tentativas THEN
+          IF l_tentativa >= l_max_tentativas THEN
             raise_application_error(-20100,
-              'Concorrência excessiva em ' || lc_nome_unidade ||
-              ' após ' || gc_max_tentativas || ' tentativas', TRUE);
+              'Conflito de ETAG não resolvido em ' || lc_nome_unidade ||
+              ' após ' || l_tentativa || ' tentativa(s)', TRUE);
           END IF;
           DBMS_SESSION.sleep(l_backoff);
           l_backoff := l_backoff * gc_backoff_fator;
@@ -250,6 +312,42 @@ CREATE OR REPLACE PACKAGE BODY concorrencia_duality_pkg AS
   END relatorio_conflitos;
 
 END concorrencia_duality_pkg;
+/
+
+-- 26ai — uso: retry automático (função idempotente) e transação do chamador
+DECLARE
+  l_documento JSON;
+BEGIN
+  concorrencia_duality_pkg.atualizar_com_retentativa(
+    p_nome_view        => 'DEPARTAMENTOS_ETAG_DV',
+    p_id_documento     => 1,
+    p_funcao_modificar => 'DEFINIR_LOCALIZACAO_DOC',
+    p_resultado        => l_documento
+  );
+  COMMIT;   -- decisão do chamador
+END;
+/
+
+-- 26ai — uso: conflito devolvido ao chamador (decisão de negócio/humana)
+DECLARE
+  e_conflito_etag EXCEPTION;
+  PRAGMA EXCEPTION_INIT(e_conflito_etag, -20100);
+  l_documento JSON;
+BEGIN
+  concorrencia_duality_pkg.atualizar_com_retentativa(
+    p_nome_view        => 'DEPARTAMENTOS_ETAG_DV',
+    p_id_documento     => 1,
+    p_funcao_modificar => 'DEFINIR_LOCALIZACAO_DOC',
+    p_resultado        => l_documento,
+    p_max_tentativas   => 1
+  );
+  COMMIT;
+EXCEPTION
+  WHEN e_conflito_etag THEN
+    ROLLBACK;
+    -- Releia o documento, apresente a divergência ao usuário e decida
+    RAISE;
+END;
 /
 
 

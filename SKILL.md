@@ -47,6 +47,7 @@ Muita coisa chegou num RU específico (HNSW ONLINE e quantização em 23.26.1, D
 6. **Não invente sintaxe.** Pacotes de IA mudam por RU; se não estiver na reference, consulte a doc 26ai ou diga que não sabe.
 7. **Naming Trivadis 4.4:** prefixos em inglês (`g_`, `gc_`, `l_`, `lc_`, `p_`, `r_`, `t_`, `co_`, `e_`), nomes em PT-BR, keywords e pacotes Oracle em inglês. Revisão de padrão → `oracle-trivadis-ptbr`.
 8. **Marque o código 26ai:** comentário `-- 26ai` e versão mínima quando a feature for de um RU específico (ex.: `-- 26ai 23.26.1+`).
+9. **Transação é do chamador; credencial nunca no script.** Package ou procedure reutilizável não faz `COMMIT`/`ROLLBACK` (use `SAVEPOINT`; log em transação autônoma). Senhas e chaves de API são pedidas em tempo de execução (`ACCEPT … HIDE`), e os privilégios são os mínimos.
 
 ## Glossário — fica em inglês
 

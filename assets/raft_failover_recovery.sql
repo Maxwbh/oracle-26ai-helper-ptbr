@@ -6,6 +6,8 @@
 -- troubleshooting.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Demonstrativo — exige topologia RAFT implantada
+-- RU mínimo: 23.26.0; Witness Replica 23.26.4+
 -- Edição Free: Sim — o Licensing Guide 26ai permite Raft Replication no Free
 --              com até 3 nós (2 CPUs, 2 GB RAM, 12 GB de dados por nó)
 --

@@ -6,6 +6,8 @@
 --        para as tabelas-base.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Executável — depende das tabelas/views de json_duality_view_basics.sql
+-- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
 --              para JSON Relational Duality Views na coluna Free
 --

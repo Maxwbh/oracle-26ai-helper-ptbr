@@ -94,10 +94,19 @@ ANTI-PATTERN 1: ...
 
 ### Verificações obrigatórias antes de PR
 
+Rode a validação estática (a mesma do CI):
+
+```bash
+python3 .github/scripts/validar_repositorio.py .
+```
+
+
 - Testou o template num ambiente 23ai/26ai real?
 - Marcou o código com `-- 26ai` e a versão mínima quando a feature for de um RU específico (ex.: `-- 26ai 23.26.1+`)?
 - Citou a fonte (docs.oracle.com, oracle-base, mikedietrichde) para cada afirmação de versão ou data?
-- Indicou no cabeçalho se o template roda no 26ai Free?
+- Preencheu no cabeçalho "Revisado", "Tipo", "RU mínimo" e "Edição Free"?
+- Nenhuma senha, token ou chave no script (use `ACCEPT … HIDE`)?
+- Package/procedure reutilizável sem `COMMIT`/`ROLLBACK` (a transação é do chamador)?
 - Adicionou ao `assets/README.md` se for template novo?
 - Atualizou `CHANGELOG.md` com a mudança?
 

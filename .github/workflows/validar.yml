@@ -1,0 +1,34 @@
+name: Validar skill
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validacao-estatica:
+    name: Validação estática (estrutura, frontmatter, templates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar repositório
+        run: python3 .github/scripts/validar_repositorio.py .
+
+      - name: Montar pacote .skill e conferir estrutura
+        run: |
+          set -euo pipefail
+          mkdir -p build/oracle-26ai-helper-ptbr
+          cp -r SKILL.md references assets CHANGELOG.md LICENSE NOTICE build/oracle-26ai-helper-ptbr/
+          (cd build && zip -qr oracle-26ai-helper-ptbr.skill oracle-26ai-helper-ptbr)
+          topo=$(unzip -Z1 build/oracle-26ai-helper-ptbr.skill | cut -d/ -f1 | sort -u | wc -l)
+          skills=$(unzip -Z1 build/oracle-26ai-helper-ptbr.skill | grep -c '/SKILL.md$')
+          test "$topo" -eq 1 && test "$skills" -eq 1
+          echo "Pacote OK: 1 pasta de topo, 1 SKILL.md"

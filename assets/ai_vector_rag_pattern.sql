@@ -17,6 +17,8 @@
 -- → LLM responde citando os chunks.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Dependente de configuração — LLM externo (OCI Generative AI) com ACL e credencial
+-- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: Parcial — retrieval (seções 2-3) roda no Free; a geração
 --              (seção 4) exige um LLM acessível por rede + ACL + credencial
 --              (ou Ollama local); o guia de licenças não lista Vector Search
@@ -42,16 +44,24 @@ Antes de rodar este template, ter:
 -- 2. Tabela de logs (auditoria — importante em ambiente forense)
 --==============================================================================
 
+-- Dados sensíveis: pergunta, contexto e resposta podem conter dados pessoais
+-- ou sigilosos. Por padrão o log guarda só o HASH da pergunta, o tamanho do
+-- contexto e métricas; o texto integral é opt-in (p_registrar_texto) e deve
+-- seguir a política de retenção/LGPD do órgão (expurgo na seção 5).
 CREATE TABLE log_consultas_rag (
-  id              NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  pergunta        VARCHAR2(4000),
-  contexto_usado  CLOB,
-  resposta_llm    CLOB,
-  modelo_llm      VARCHAR2(200),
-  qtd_chunks      NUMBER,
-  tempo_ms        NUMBER,
-  usuario         VARCHAR2(128) DEFAULT USER,
-  consultado_em   TIMESTAMP DEFAULT SYSTIMESTAMP
+  id                NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  pergunta_hash     RAW(32)        NOT NULL,   -- SHA-256 da pergunta
+  pergunta          VARCHAR2(4000),            -- só com p_registrar_texto
+  contexto_usado    CLOB,                      -- só com p_registrar_texto
+  resposta_llm      CLOB,                      -- só com p_registrar_texto
+  tamanho_contexto  NUMBER,
+  modelo_llm        VARCHAR2(200),
+  qtd_chunks        NUMBER,
+  tempo_ms          NUMBER,
+  situacao          VARCHAR2(10)   NOT NULL,   -- OK | ERRO
+  erro              VARCHAR2(4000),
+  usuario           VARCHAR2(128)  DEFAULT USER,
+  consultado_em     TIMESTAMP      DEFAULT SYSTIMESTAMP
 );
 
 
@@ -134,15 +144,22 @@ END;
 GRANT CREATE CREDENTIAL TO usuario_vetor;
 
 -- 26ai — Setup (como usuario_vetor): credencial OCI (chave de API do usuário OCI).
--- Valores reais NÃO devem ir para o Git.
+-- Valores reais NÃO ficam no script: são pedidos em tempo de execução
+-- (SQLcl/SQL*Plus, ACCEPT ... HIDE) e descartados com UNDEFINE.
+ACCEPT oci_user_ocid        CHAR PROMPT 'user_ocid: '
+ACCEPT oci_tenancy_ocid     CHAR PROMPT 'tenancy_ocid: '
+ACCEPT oci_compartment_ocid CHAR PROMPT 'compartment_ocid: '
+ACCEPT oci_private_key      CHAR PROMPT 'private_key (sem BEGIN/END, uma linha): ' HIDE
+ACCEPT oci_fingerprint      CHAR PROMPT 'fingerprint: '
+
 DECLARE
   l_credencial JSON_OBJECT_T := JSON_OBJECT_T();
 BEGIN
-  l_credencial.put('user_ocid',        '<ocid1.user...>');
-  l_credencial.put('tenancy_ocid',     '<ocid1.tenancy...>');
-  l_credencial.put('compartment_ocid', '<ocid1.compartment...>');
-  l_credencial.put('private_key',      '<chave_privada_sem_BEGIN_END>');
-  l_credencial.put('fingerprint',      '<fingerprint>');
+  l_credencial.put('user_ocid',        '&oci_user_ocid');
+  l_credencial.put('tenancy_ocid',     '&oci_tenancy_ocid');
+  l_credencial.put('compartment_ocid', '&oci_compartment_ocid');
+  l_credencial.put('private_key',      '&oci_private_key');
+  l_credencial.put('fingerprint',      '&oci_fingerprint');
 
   DBMS_VECTOR_CHAIN.CREATE_CREDENTIAL(
     credential_name => 'CRED_OCI_GENAI',
@@ -150,6 +167,8 @@ BEGIN
   );
 END;
 /
+
+UNDEFINE oci_user_ocid oci_tenancy_ocid oci_compartment_ocid oci_private_key oci_fingerprint
 
 -- 26ai
 CREATE OR REPLACE FUNCTION gerar_resposta_llm (
@@ -199,19 +218,73 @@ BEGIN
 
   DBMS_LOB.freetemporary(l_prompt);
   RETURN l_resposta;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    -- Libera o LOB temporário também em caso de erro (evita vazamento de
+    -- espaço temporário na sessão) e propaga o erro original
+    IF DBMS_LOB.istemporary(l_prompt) = 1 THEN
+      DBMS_LOB.freetemporary(l_prompt);
+    END IF;
+    RAISE;
 END gerar_resposta_llm;
 /
 
 
 --==============================================================================
 -- 5. Procedure orquestradora — RAG completo
+--
+-- Contrato transacional: consultar_rag NÃO faz COMMIT nem ROLLBACK. A
+-- transação de negócio pertence ao chamador. A auditoria é gravada por
+-- registrar_consulta_rag em transação AUTÔNOMA, para que o log sobreviva a
+-- um ROLLBACK do chamador e não confirme nada da transação dele.
 --==============================================================================
 
 -- 26ai
+CREATE OR REPLACE PROCEDURE registrar_consulta_rag (
+  p_pergunta        IN VARCHAR2,
+  p_contexto        IN CLOB,
+  p_resposta        IN CLOB,
+  p_modelo_llm      IN VARCHAR2,
+  p_qtd_chunks      IN PLS_INTEGER,
+  p_tempo_ms        IN NUMBER,
+  p_situacao        IN VARCHAR2,
+  p_erro            IN VARCHAR2,
+  p_registrar_texto IN BOOLEAN
+) IS
+  PRAGMA AUTONOMOUS_TRANSACTION;
+  l_pergunta  VARCHAR2(4000);
+  l_contexto  CLOB;
+  l_resposta  CLOB;
+BEGIN
+  -- Mascaramento: por padrão grava só o hash SHA-256 da pergunta e o tamanho
+  -- do contexto. Texto integral (pergunta, contexto, resposta) só quando a
+  -- política de privacidade/LGPD do órgão autorizar (p_registrar_texto).
+  IF p_registrar_texto THEN
+    l_pergunta := SUBSTR(p_pergunta, 1, 4000);
+    l_contexto := p_contexto;
+    l_resposta := p_resposta;
+  END IF;
+
+  INSERT INTO log_consultas_rag (
+    pergunta_hash, pergunta, contexto_usado, resposta_llm, tamanho_contexto,
+    modelo_llm, qtd_chunks, tempo_ms, situacao, erro
+  ) VALUES (
+    STANDARD_HASH(NVL(p_pergunta, ' '), 'SHA256'),
+    l_pergunta, l_contexto, l_resposta,
+    DBMS_LOB.getlength(p_contexto),
+    p_modelo_llm, p_qtd_chunks, p_tempo_ms, p_situacao, SUBSTR(p_erro, 1, 4000)
+  );
+  COMMIT;   -- confirma APENAS a transação autônoma do log
+END registrar_consulta_rag;
+/
+
+-- 26ai
 CREATE OR REPLACE PROCEDURE consultar_rag (
-  p_pergunta   IN  VARCHAR2,
-  p_modelo_llm IN  VARCHAR2,
-  p_resposta   OUT CLOB
+  p_pergunta        IN  VARCHAR2,
+  p_modelo_llm      IN  VARCHAR2,
+  p_resposta        OUT CLOB,
+  p_registrar_texto IN  BOOLEAN DEFAULT FALSE
 ) IS
   lc_nome_unidade CONSTANT VARCHAR2(60) := 'CONSULTAR_RAG';
 
@@ -219,7 +292,15 @@ CREATE OR REPLACE PROCEDURE consultar_rag (
   l_inicio      TIMESTAMP;
   l_duracao     INTERVAL DAY TO SECOND;
   l_tempo_ms    NUMBER;
-  l_qtd_chunks  PLS_INTEGER;
+  l_qtd_chunks  PLS_INTEGER := 0;
+
+  FUNCTION calcular_tempo_ms RETURN NUMBER IS
+  BEGIN
+    l_duracao := SYSTIMESTAMP - l_inicio;
+    RETURN EXTRACT(HOUR   FROM l_duracao) * 3600000 +
+           EXTRACT(MINUTE FROM l_duracao) * 60000 +
+           EXTRACT(SECOND FROM l_duracao) * 1000;
+  END calcular_tempo_ms;
 BEGIN
   l_inicio := SYSTIMESTAMP;
 
@@ -237,7 +318,7 @@ BEGIN
   );
 
   -- Conta chunks recuperados (parsing simples do contexto)
-  l_qtd_chunks := REGEXP_COUNT(l_contexto, '\[Documento:');
+  l_qtd_chunks := NVL(REGEXP_COUNT(l_contexto, '\[Documento:'), 0);
 
   -- Etapa G: generation — sem contexto, NÃO chama o LLM (evita alucinação
   -- e custo de chamada)
@@ -251,28 +332,52 @@ BEGIN
     );
   END IF;
 
-  -- Tempo total
-  l_duracao  := SYSTIMESTAMP - l_inicio;
-  l_tempo_ms := EXTRACT(HOUR   FROM l_duracao) * 3600000 +
-                EXTRACT(MINUTE FROM l_duracao) * 60000 +
-                EXTRACT(SECOND FROM l_duracao) * 1000;
+  l_tempo_ms := calcular_tempo_ms;
 
-  -- Auditoria
-  INSERT INTO log_consultas_rag (
-    pergunta, contexto_usado, resposta_llm,
-    modelo_llm, qtd_chunks, tempo_ms
-  ) VALUES (
-    p_pergunta, l_contexto, p_resposta,
-    p_modelo_llm, l_qtd_chunks, l_tempo_ms
+  -- Auditoria (transação autônoma — não interfere na do chamador)
+  registrar_consulta_rag(
+    p_pergunta        => p_pergunta,
+    p_contexto        => l_contexto,
+    p_resposta        => p_resposta,
+    p_modelo_llm      => p_modelo_llm,
+    p_qtd_chunks      => l_qtd_chunks,
+    p_tempo_ms        => l_tempo_ms,
+    p_situacao        => 'OK',
+    p_erro            => NULL,
+    p_registrar_texto => p_registrar_texto
   );
-  COMMIT;
 
 EXCEPTION
   WHEN OTHERS THEN
-    ROLLBACK;
+    -- Registra a falha (autônomo) e devolve o erro; o ROLLBACK, se
+    -- necessário, é decisão do chamador.
+    registrar_consulta_rag(
+      p_pergunta        => p_pergunta,
+      p_contexto        => l_contexto,
+      p_resposta        => NULL,
+      p_modelo_llm      => p_modelo_llm,
+      p_qtd_chunks      => l_qtd_chunks,
+      p_tempo_ms        => calcular_tempo_ms,
+      p_situacao        => 'ERRO',
+      p_erro            => SQLERRM,
+      p_registrar_texto => p_registrar_texto
+    );
     raise_application_error(-20999,
       'Erro em ' || lc_nome_unidade || ': ' || SQLERRM, TRUE);
 END consultar_rag;
+/
+
+-- 26ai — retenção do log: expurgo periódico (agende com DBMS_SCHEDULER).
+-- O prazo de retenção é definido pela política do órgão (LGPD, normas
+-- forenses) — 90 dias é só um valor de exemplo.
+CREATE OR REPLACE PROCEDURE expurgar_log_rag (
+  p_dias_retencao IN PLS_INTEGER DEFAULT 90
+) IS
+BEGIN
+  DELETE FROM log_consultas_rag
+   WHERE consultado_em < SYSTIMESTAMP - NUMTODSINTERVAL(p_dias_retencao, 'DAY');
+  -- Rotina de manutenção (job), não API de negócio: o COMMIT fica no job.
+END expurgar_log_rag;
 /
 
 
@@ -311,19 +416,27 @@ SELECT AVG(tempo_ms) AS tempo_medio_ms,
   FROM log_consultas_rag
  WHERE consultado_em > SYSTIMESTAMP - INTERVAL '7' DAY;
 
--- Perguntas onde nenhum chunk foi encontrado (ajustar threshold ou enriquecer corpus)
-SELECT pergunta, consultado_em
+-- Consultas onde nenhum chunk foi encontrado (ajustar threshold ou enriquecer
+-- corpus). "pergunta" só vem preenchida se o texto foi registrado (opt-in).
+SELECT pergunta_hash, pergunta, consultado_em
   FROM log_consultas_rag
  WHERE qtd_chunks = 0
+   AND situacao = 'OK'
  ORDER BY consultado_em DESC
  FETCH FIRST 20 ROWS ONLY;
 
--- Top 10 perguntas mais frequentes (oportunidade de FAQ)
-SELECT pergunta, COUNT(*) AS qtd
+-- Top 10 perguntas repetidas (oportunidade de FAQ) — agrupadas pelo hash
+SELECT pergunta_hash, MAX(pergunta) AS pergunta_se_registrada, COUNT(*) AS qtd
   FROM log_consultas_rag
- GROUP BY pergunta
+ GROUP BY pergunta_hash
  ORDER BY qtd DESC
  FETCH FIRST 10 ROWS ONLY;
+
+-- Taxa de erro (falhas do provedor de LLM, rede, credencial)
+SELECT situacao, COUNT(*) AS qtd
+  FROM log_consultas_rag
+ WHERE consultado_em > SYSTIMESTAMP - INTERVAL '7' DAY
+ GROUP BY situacao;
 
 
 --==============================================================================
@@ -331,9 +444,15 @@ SELECT pergunta, COUNT(*) AS qtd
 --==============================================================================
 
 /*
-ANTI-PATTERN 1: Não logar contexto enviado ao LLM
+ANTI-PATTERN 1: Logar tudo (ou nada) sem política
   - Sem log, impossível auditar de onde veio cada resposta
-  - Em ambientes regulados (forense, jurídico, financeiro), isso é OBRIGATÓRIO
+  - Log integral sem política expõe dados pessoais/sigilosos (LGPD)
+  - Padrão aqui: hash + métricas sempre; texto integral opt-in; expurgo por
+    prazo definido pelo órgão; log em transação autônoma
+
+ANTI-PATTERN 1b: COMMIT/ROLLBACK dentro de API reutilizável
+  - Confirma ou desfaz trabalho do chamador sem ele saber
+  - A transação é do chamador; só o log usa PRAGMA AUTONOMOUS_TRANSACTION
 
 ANTI-PATTERN 2: Limite de chunks muito alto
   - Top 100 chunks = prompt muito longo, LLM perde foco

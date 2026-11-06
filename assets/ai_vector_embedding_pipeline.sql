@@ -9,6 +9,8 @@
 -- Embedding direto de documento inteiro perde nuance — precisa chunking.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Dependente de configuração — modelo ONNX no banco; provedor externo exige rede, ACL e credencial
+-- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: Parcial — chunking e embedding com modelo ONNX no banco rodam
 --              no Free (limite de 2 GB de RAM pesa no modelo); a seção 6
 --              (provedor externo) exige rede de saída, ACL e credencial; o
@@ -147,14 +149,21 @@ COMMIT;
 -- 26ai
 CREATE OR REPLACE PACKAGE pipeline_embedding_pkg AS
 
-  -- Reprocessa um documento (apaga e recria seus chunks). Faz COMMIT.
+  -- Reprocessa um documento (apaga e recria seus chunks).
+  -- Contrato transacional: NÃO faz COMMIT. A transação pertence ao chamador
+  -- (ex.: gravar o documento e seus chunks numa mesma unidade de trabalho).
+  -- Em erro, desfaz só o próprio trabalho (ROLLBACK TO SAVEPOINT) e propaga.
+  -- p_modelo: só modelos cadastrados em USER_MINING_MODELS são aceitos.
   PROCEDURE processar_documento (
     p_id_documento  IN NUMBER,
     p_modelo        IN VARCHAR2 DEFAULT NULL
   );
 
-  -- Processa documentos criados desde p_data_corte ou ainda sem chunks.
-  PROCEDURE processar_pendentes (
+  -- Rotina de LOTE (job/agendamento), não API de negócio: processa documentos
+  -- criados desde p_data_corte ou ainda sem chunks e confirma CADA documento
+  -- (COMMIT por documento), para que uma falha não desfaça o lote inteiro.
+  -- Não chame de dentro de uma transação de aplicação.
+  PROCEDURE processar_pendentes_lote (
     p_data_corte IN DATE DEFAULT SYSDATE - 1
   );
 
@@ -180,9 +189,24 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
     l_modelo        VARCHAR2(128);
     l_qtd_chunks    PLS_INTEGER;
   BEGIN
+    -- Ponto de retorno para desfazer SÓ o trabalho desta procedure
+    SAVEPOINT sp_processar_documento;
+
     -- O nome do modelo entra no SQL como identificador (VECTOR_EMBEDDING não
     -- aceita bind no nome) → valida contra SQL injection.
     l_modelo := DBMS_ASSERT.SIMPLE_SQL_NAME(NVL(p_modelo, gc_modelo_default));
+
+    -- Allowlist: além da forma do nome, exige que o modelo exista no schema
+    BEGIN
+      SELECT m.model_name
+        INTO l_modelo
+        FROM user_mining_models m
+       WHERE m.model_name = UPPER(l_modelo);
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        raise_application_error(-20104,
+          'Modelo não cadastrado: ' || l_modelo || ' em ' || lc_nome_unidade);
+    END;
 
     -- Recupera documento
     SELECT conteudo INTO l_conteudo
@@ -204,8 +228,7 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
     ]' USING p_id_documento, l_conteudo, gc_params_chunk;
 
     l_qtd_chunks := SQL%ROWCOUNT;
-
-    COMMIT;
+    -- Sem COMMIT: a transação é do chamador
 
     DBMS_OUTPUT.put_line(
       lc_nome_unidade || ': documento ' || p_id_documento ||
@@ -217,16 +240,18 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
       raise_application_error(-20101,
         'Documento não encontrado: ' || p_id_documento || ' em ' || lc_nome_unidade);
     WHEN OTHERS THEN
-      ROLLBACK;
+      -- Desfaz só o que esta procedure fez; o trabalho anterior do chamador
+      -- permanece
+      ROLLBACK TO sp_processar_documento;
       raise_application_error(-20999,
         'Erro em ' || lc_nome_unidade || ': ' || SQLERRM, TRUE);
   END processar_documento;
 
 
-  PROCEDURE processar_pendentes (
+  PROCEDURE processar_pendentes_lote (
     p_data_corte IN DATE DEFAULT SYSDATE - 1
   ) IS
-    lc_nome_unidade CONSTANT VARCHAR2(60) := gc_nome_pacote || '.processar_pendentes';
+    lc_nome_unidade CONSTANT VARCHAR2(60) := gc_nome_pacote || '.processar_pendentes_lote';
     l_total_processados PLS_INTEGER := 0;
   BEGIN
     -- Loop por DOCUMENTO (não por linha de chunk): cada documento é uma
@@ -240,13 +265,14 @@ CREATE OR REPLACE PACKAGE BODY pipeline_embedding_pkg AS
                           WHERE c.id_documento = d.id)
     ) LOOP
       processar_documento(r_documento.id);
+      COMMIT;   -- rotina de lote: confirma documento a documento
       l_total_processados := l_total_processados + 1;
     END LOOP;
 
     DBMS_OUTPUT.put_line(
       lc_nome_unidade || ': ' || l_total_processados || ' documentos processados'
     );
-  END processar_pendentes;
+  END processar_pendentes_lote;
 
 END pipeline_embedding_pkg;
 /
@@ -297,14 +323,22 @@ GRANT CREATE CREDENTIAL TO usuario_vetor;
 -- OpenAI, Cohere, Google AI, Hugging Face e Vertex AI usam {"access_token": ...}.
 -- Só OCI Generative AI ("ocigenai") usa user_ocid/tenancy_ocid/
 -- compartment_ocid/private_key/fingerprint.
--- Nunca deixe a chave real em script versionado.
+-- Nunca deixe a chave real em script versionado: ela é pedida em tempo de
+-- execução (SQLcl/SQL*Plus) e descartada com UNDEFINE.
+ACCEPT chave_api_openai CHAR PROMPT 'Chave da API OpenAI: ' HIDE
+
+DECLARE
+  l_credencial JSON_OBJECT_T := JSON_OBJECT_T();
 BEGIN
+  l_credencial.put('access_token', '&chave_api_openai');
   DBMS_VECTOR_CHAIN.CREATE_CREDENTIAL(
     credential_name => 'CRED_OPENAI',
-    params          => JSON('{ "access_token": "<chave_api_openai>" }')
+    params          => JSON(l_credencial.to_string)
   );
 END;
 /
+
+UNDEFINE chave_api_openai
 
 -- 26ai — geração via API externa: UTL_TO_EMBEDDING devolve UM VECTOR
 -- (função escalar no SELECT). Para vários chunks de uma vez use

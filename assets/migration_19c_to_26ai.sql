@@ -8,6 +8,8 @@
 -- não substituto de planejamento DBA dedicado.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Demonstrativo — roteiro de planejamento; comandos em comentários
+-- RU mínimo: origem 19c ou 21c; destino 23.26.x (RU mais recente)
 -- Edição Free: Parcial — serve como DESTINO de laboratório (26ai Free,
 --   2 cores / 2 GB RAM / 12 GB de dados); upgrade de produção é EE.
 -- Operação detalhada do upgrade (RMAN, Data Guard, PDB): oracle-dba-ptbr

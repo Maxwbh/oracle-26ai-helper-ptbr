@@ -17,6 +17,10 @@ Revisão completa contra a documentação Oracle AI Database 26ai (RU 23.26.4, o
 - Tabelas de novidades por Release Update (23.6 → 23.26.4) em Vector, Duality e RAFT
 - `## Índice` nas references com mais de 100 linhas
 - Marcação `-- 26ai` com versão mínima de RU (ex.: `-- 26ai 23.26.1+`) no código
+- Cabeçalho de cada template com "Tipo" (executável / dependente de configuração / demonstrativo) e "RU mínimo"
+- Validação automática no GitHub Actions (`.github/workflows/validar.yml` + `.github/scripts/validar_repositorio.py`): frontmatter, `suite_size`, references citadas e com índice, cabeçalhos dos templates, credenciais fixas, sintaxe sabidamente inexistente e referências à skill antiga; monta o pacote `.skill` e confere a estrutura
+- Allowlist `cfg_retentativa_etag` e contrato de idempotência no retry de ETag (`p_max_tentativas => 1` devolve o conflito ao chamador)
+- Auditoria do RAG em transação autônoma, com hash SHA-256 da pergunta, texto integral opt-in (`p_registrar_texto`), situação OK/ERRO e expurgo por retenção (`expurgar_log_rag`)
 
 ### Alterado
 - `description` reescrita com ATIVE / Frases / NÃO ATIVE e ponteiros para a suíte
@@ -44,6 +48,10 @@ Revisão completa contra a documentação Oracle AI Database 26ai (RU 23.26.4, o
 - `UTL_TO_CHUNKS` retorna `VECTOR_ARRAY_T` de JSON (leitura via `JSON_VALUE`); `UTL_TO_EMBEDDING` é escalar
 - Brechas de SQL injection nos pacotes de pipeline e de retry de ETag (nomes validados com `DBMS_ASSERT` e usados de fato)
 - Packages sem SPEC; prefixo `co_` usado em cursor (Trivadis: `c_`)
+- Senha fixa no `CREATE USER` e chaves de API no script → `ACCEPT … HIDE` + `UNDEFINE`; `DB_DEVELOPER_ROLE` → privilégios mínimos; `DIRECTORY` só com READ
+- `COMMIT`/`ROLLBACK` dentro de APIs reutilizáveis: `processar_documento` usa `SAVEPOINT` e não confirma; o lote passa a ser `processar_pendentes_lote`; `consultar_rag` não confirma nem desfaz a transação do chamador
+- LOB temporário de `gerar_resposta_llm` liberado também em caso de erro
+- Nome do modelo em `processar_documento` validado contra `USER_MINING_MODELS` (além de `DBMS_ASSERT`)
 - Views inexistentes `user_vector_indexes` e `v$sgastat 'vector pool'` → `V$VECTOR_INDEX` e `V$VECTOR_MEMORY_POOL`
 - ORDS AutoREST de duality views: 23.1+ (antes 24.1+)
 - RAFT: habilitado por `create shardcatalog -repl native` (default DG); RF fixo 3; heartbeat 150 ms; failover automático; `switchover ru -ru <id> -database <db>`; views `V$SHARD_REPLICATION_UNIT` e `SHARD_RAFT_PARAMETERS`; licença (Free até 3 nós; EE com RAC por shard)

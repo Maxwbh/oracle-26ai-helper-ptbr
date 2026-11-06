@@ -5,6 +5,8 @@
 -- distribuição de chunks, parâmetros por RU e monitoração em SQL.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Demonstrativo — exige topologia RAFT implantada
+-- RU mínimo: 23.26.0; REPLICA_TYPE em V$SHARD_REPLICATION_UNIT 23.26.1+
 -- Edição Free: Sim — o Licensing Guide 26ai permite Raft Replication no Free
 --              com até 3 nós (2 CPUs, 2 GB RAM, 12 GB de dados por nó)
 --

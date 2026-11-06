@@ -11,7 +11,19 @@ Esta skill aprofunda Vector Search, JSON Duality, RAFT e migração. Para o rest
 - Comentários em PT-BR
 - Código exclusivo do 26ai marcado com `-- 26ai`, com a versão mínima quando a feature chegou num RU específico (ex.: `-- 26ai 23.26.1+`)
 - Pontos sem confirmação na documentação marcados `-- A VERIFICAR`
-- Cada cabeçalho traz as linhas "Revisado" e "Edição Free"
+- Cada cabeçalho traz as linhas "Revisado", "Tipo", "RU mínimo" e "Edição Free"
+- Nenhuma senha, token ou chave fica no script: credenciais são pedidas em tempo de execução (`ACCEPT … HIDE` no SQLcl/SQL*Plus)
+- APIs reutilizáveis (packages e procedures) **não fazem COMMIT nem ROLLBACK**: a transação pertence ao chamador. Exceções documentadas: rotinas de lote/manutenção (`processar_pendentes_lote`, `expurgar_log_rag`) e logs em transação autônoma
+
+## Tipo de cada template
+
+| Tipo | Significado | Templates |
+|---|---|---|
+| **Executável** | Cria os próprios objetos de exemplo e roda num 26ai limpo, na ordem indicada | `json_duality_view_basics.sql` → `json_duality_dml.sql` → `json_duality_etag_concurrency.sql` |
+| **Dependente de configuração** | Roda depois de preparar algo fora do script (arquivo ONNX no servidor, Vector Pool, ACL, credencial de provedor) | `ai_vector_search_basics.sql` → `ai_vector_index_strategies.sql` → `ai_vector_embedding_pipeline.sql` → `ai_vector_rag_pattern.sql` |
+| **Demonstrativo** | Roteiro comentado; exige infraestrutura que um script não cria (topologia RAFT com GSM e 3+ shards, banco 19c de origem) | `raft_*.sql`, `migration_19c_to_26ai.sql` |
+
+Nenhum template foi executado em banco no CI: a validação automática (`.github/workflows/validar.yml`) é estática. Antes de usar em produção, rode-os num 26ai de teste.
 
 ## Índice por área
 

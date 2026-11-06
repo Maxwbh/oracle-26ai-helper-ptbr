@@ -8,6 +8,8 @@
 --                Em 19c não funciona — VECTOR e VECTOR_EMBEDDING não existem.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Dependente de configuração — exige o arquivo ONNX no servidor (DIRECTORY) e Vector Pool para HNSW
+-- RU mínimo: 23.26.0 (qualquer 26ai); blocos de RU específico marcados no código
 -- Edição Free: Parcial — VECTOR, ONNX e busca exata cabem no Free, mas o guia
 --              de licenciamento não cita Vector Search explicitamente para o
 --              Free (OML/ONNX sem custo extra) e o limite de 2 GB de RAM
@@ -75,17 +77,30 @@ SELECT con_id, pool,
 
 CREATE BIGFILE TABLESPACE tbs_vector DATAFILE SIZE 256M AUTOEXTEND ON MAXSIZE 2G;
 
-CREATE USER usuario_vetor IDENTIFIED BY "Oracle_4U_dev"
+-- Senha: NUNCA fica no script. Informe em tempo de execução (SQLcl/SQL*Plus)
+-- ou use o cofre de senhas do ambiente. Não reaproveite este usuário fora do
+-- laboratório.
+ACCEPT senha_usuario_vetor CHAR PROMPT 'Senha para USUARIO_VETOR: ' HIDE
+
+CREATE USER usuario_vetor IDENTIFIED BY "&senha_usuario_vetor"
   DEFAULT TABLESPACE tbs_vector
   TEMPORARY TABLESPACE TEMP
-  QUOTA UNLIMITED ON tbs_vector;
+  QUOTA 2G ON tbs_vector;
 
-GRANT DB_DEVELOPER_ROLE TO usuario_vetor;      -- 26ai (23ai)
+UNDEFINE senha_usuario_vetor
+
+-- Privilégios MÍNIMOS para este template (tabelas, índices no próprio schema,
+-- packages/procedures e o modelo ONNX)
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW,
+      CREATE SEQUENCE, CREATE PROCEDURE TO usuario_vetor;
 GRANT CREATE MINING MODEL TO usuario_vetor;    -- exigido para LOAD_ONNX_MODEL
+-- Alternativa só para laboratório pessoal: DB_DEVELOPER_ROLE (23ai+) concede
+-- bem mais do que este template precisa — evite em ambientes compartilhados.
 
--- Diretório (no servidor do banco) de onde o modelo ONNX será lido
+-- Diretório (no servidor do banco) de onde o modelo ONNX será lido.
+-- LOAD_ONNX_MODEL só LÊ o arquivo: conceda READ, não WRITE.
 CREATE OR REPLACE DIRECTORY dir_modelos AS '/home/oracle/embedding_models';
-GRANT READ, WRITE ON DIRECTORY dir_modelos TO usuario_vetor;
+GRANT READ ON DIRECTORY dir_modelos TO usuario_vetor;
 
 
 --==============================================================================

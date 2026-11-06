@@ -7,6 +7,8 @@
 -- Pré-requisito: tabela com VECTOR já populada (ver ai_vector_search_basics.sql).
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Dependente de configuração — exige o modelo ONNX e as tabelas de ai_vector_search_basics.sql
+-- RU mínimo: 23.26.0; ONLINE/quantização SCALAR 23.26.1+; HNSW local 23.26.2+; PRODUCT 23.26.4+
 -- Edição Free: Parcial — HNSW depende do vector pool dentro do limite de 2 GB
 --              de RAM; recursos de RAC (distributed HNSW) não se aplicam; os
 --              blocos marcados 23.26.x exigem que a imagem Free esteja nesse RU

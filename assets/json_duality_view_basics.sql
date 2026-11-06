@@ -6,6 +6,8 @@
 --        anotações de DML e exposição via REST (ORDS) / MongoDB API.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Tipo: Executável — cria as próprias tabelas de exemplo
+-- RU mínimo: 23.26.0 (GRAPHQL()); validation directives 23.26.2+; array limits 23.26.3+
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
 --              para JSON Relational Duality Views na coluna Free (o recurso não
 --              aparece como opção paga; confirme antes de afirmar ao cliente)
