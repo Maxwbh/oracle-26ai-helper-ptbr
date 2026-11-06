@@ -50,11 +50,20 @@ Implicações:
 Para índices HNSW, dimensione o Vector Pool:
 
 ```sql
--- 26ai — parâmetro dinâmico; no CDB = tamanho do pool, no PDB = cota
-ALTER SYSTEM SET vector_memory_size = 1G SCOPE = BOTH;
+-- 26ai — no CDB$ROOT: com pool em 0, o aumento só vale após restart
+ALTER SYSTEM SET vector_memory_size = 1G SCOPE = SPFILE;
+-- (reiniciar a instância na janela do upgrade)
+-- no PDB: cota, dinâmica e limitada ao pool do CDB
+ALTER SYSTEM SET vector_memory_size = 512M SCOPE = BOTH;
 ```
 
-Default 0, range 0–70% da SGA, modificável no PDB. Valor `1` com `sga_target > 0` ativa o auto-sizing (23.8+). Não há parâmetro para "ligar" Vector Search ou Duality Views.
+Default 0, range 0–70% da SGA, modificável no PDB. Inclua o tamanho do pool no SPFILE já na janela do upgrade para evitar um restart depois:
+- **CDB com pool 0 no startup:** aumentar exige `SCOPE=SPFILE` + restart (sem restart → ORA-51950).
+- **CDB com pool alocado no startup:** cresce dinamicamente; não reduz abaixo do valor inicial (ORA-51953).
+- **PDB:** cota dinâmica (`SCOPE=BOTH`), limitada ao pool do CDB (ORA-51955).
+- Medido no 26ai Free 23.26.3 (nov/2026). A doc lista o parâmetro como modificável por `ALTER SYSTEM`, mas não detalha essas restrições.
+
+ Valor `1` com `sga_target > 0` ativa o auto-sizing (23.8+). Não há parâmetro para "ligar" Vector Search ou Duality Views.
 
 ## AutoUpgrade — ferramenta canônica
 

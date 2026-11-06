@@ -7,6 +7,7 @@
 -- Pré-requisito: tabela com VECTOR já populada (ver ai_vector_search_basics.sql).
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — OK; PRODUCT falha como esperado (23.26.4+); DBMS_VECTOR_ADMIN e V$ exigem DBA/SELECT_CATALOG_ROLE
 -- Tipo: Dependente de configuração — exige o modelo ONNX e as tabelas de ai_vector_search_basics.sql
 -- RU mínimo: 23.26.0; ONLINE/quantização SCALAR 23.26.1+; HNSW local 23.26.2+; PRODUCT 23.26.4+
 -- Edição Free: Parcial — HNSW depende do vector pool dentro do limite de 2 GB
@@ -77,6 +78,9 @@ PARAMETERS (
   EFCONSTRUCTION   100    -- candidatos avaliados por passo na inserção (1..65535)
 );
 
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_hnsw;
+
 -- Parâmetros explicados:
 --   NEIGHBORS (sinônimo: M): mais = recall melhor, build mais lento, mais memória
 --   EFCONSTRUCTION: mais = grafo de melhor qualidade, build mais lento
@@ -96,6 +100,9 @@ PARAMETERS (
   NEIGHBORS        32,         -- grafo mais denso
   EFCONSTRUCTION   200         -- construção mais cuidadosa
 );
+
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_hnsw_alto;
 -- (Na prática você terá UM índice vetorial por coluna; os exemplos acima são
 --  alternativas — drope um antes de testar o outro.)
 
@@ -110,14 +117,17 @@ WITH TARGET ACCURACY 95
 PARAMETERS (TYPE HNSW, NEIGHBORS 32, EFCONSTRUCTION 200)
 ONLINE;
 
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_hnsw_online;
+
 
 -- Verificar índices criados (dicionário padrão)
 SELECT index_name, index_type, status
   FROM user_indexes
  WHERE table_name = 'DOCUMENTOS_FORENSES';
 
--- 26ai — detalhes específicos de índice vetorial (fixed view; exige SELECT
--- em V$ — conceda via role de monitoração ou consulte como DBA)
+-- 26ai — detalhes específicos de índice vetorial (fixed view): exige
+-- SELECT_CATALOG_ROLE ou consulta como DBA (sem isso → ORA-00942)
 SELECT owner, index_name, index_organization, distance_type,
        index_dimensions, index_dim_type, num_vectors,
        allocated_bytes / 1024 / 1024 AS alocado_mb,   -- 0 para IVF
@@ -153,6 +163,9 @@ PARAMETERS (
   NEIGHBOR PARTITIONS 100   -- nº alvo de partições/centróides (1..10.000.000)
 );
 
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_ivf;
+
 -- Parâmetros explicados:
 --   NEIGHBOR PARTITIONS: número alvo de centróides que dividem o espaço vetorial
 --     - sem o parâmetro, o banco escolhe; referência informal comum: ~sqrt(n)
@@ -168,13 +181,15 @@ PARAMETERS (
 
 
 -- 26ai — IVF local (em tabela particionada)
-CREATE VECTOR INDEX idx_doc_forense_ivf_local
-ON documentos_forenses_part (embedding)
-ORGANIZATION NEIGHBOR PARTITIONS
-DISTANCE COSINE
-WITH TARGET ACCURACY 90
-PARAMETERS (TYPE IVF, NEIGHBOR PARTITIONS 100)
-LOCAL;  -- uma partição de índice por partição da tabela
+-- Pré-requisito: tabela PARTICIONADA documentos_forenses_part com coluna
+-- VECTOR (não criada neste template). Uma partição de índice por partição.
+-- CREATE VECTOR INDEX idx_doc_forense_ivf_local
+-- ON documentos_forenses_part (embedding)
+-- ORGANIZATION NEIGHBOR PARTITIONS
+-- DISTANCE COSINE
+-- WITH TARGET ACCURACY 90
+-- PARAMETERS (TYPE IVF, NEIGHBOR PARTITIONS 100)
+-- LOCAL;
 
 
 -- 26ai 23.26.1+ — IVF ONLINE (não suportado para IVF LOCAL nem com included columns)
@@ -198,6 +213,7 @@ ONLINE;
 --==============================================================================
 
 -- 26ai — query que USA o índice
+-- APPROX para usar índice
 SELECT id, titulo, categoria,
        VECTOR_DISTANCE(
          embedding,
@@ -206,7 +222,7 @@ SELECT id, titulo, categoria,
        ) AS distancia
   FROM documentos_forenses
  ORDER BY distancia
- FETCH APPROX FIRST 10 ROWS ONLY;  -- APPROX para usar índice
+ FETCH APPROX FIRST 10 ROWS ONLY;
 
 
 -- 26ai — verificar se o índice foi usado
@@ -248,19 +264,21 @@ SELECT id, titulo,
 
 -- 26ai (23ai 23.9+) — IVF: rebuild/reorganização online (após muitas DMLs a
 -- distribuição dos centróides degrada)
-ALTER INDEX idx_doc_forense_ivf REBUILD ONLINE;
+ALTER INDEX idx_doc_forense_ivf_online REBUILD ONLINE;
 
 -- 26ai 23.26.1+ — IVF: rebuild online trocando parâmetros (sem drop/create)
 -- A VERIFICAR: a doc lista NEIGHBOR PARTITIONS, SAMPLES_PER_PARTITION e
 -- MIN_VECTORS_PER_PARTITION juntos no PARAMETERS do REBUILD; não deixa claro se
 -- cada um pode ser informado isoladamente — teste antes de usar em GMUD.
-ALTER INDEX idx_doc_forense_ivf REBUILD
+ALTER INDEX idx_doc_forense_ivf_online REBUILD
   PARAMETERS (NEIGHBOR PARTITIONS 200)
   ONLINE;
 
 -- 26ai 23.26.1+ — IVF: reorganização AUTOMÁTICA por job em background
 -- (DBMS_VECTOR_ADMIN; default habilitado; dispara quando o DML passa de 20%
 --  das linhas, em tabelas com >= 100.000 linhas; não vale com included columns)
+-- Rodar como DBA: EXECUTE em DBMS_VECTOR_ADMIN é concedido ao PDB_DBA
+-- (usuário de aplicação recebe PLS-00201 — verificado no 26ai Free 23.26.3).
 BEGIN
   DBMS_VECTOR_ADMIN.SET_PARAMETER(
     parameter => DBMS_VECTOR_ADMIN.VECTOR_INDEX_OPTIMIZATION_BACKGROUND_INTERVAL,
@@ -270,24 +288,10 @@ END;
 /
 
 
--- 26ai — HNSW: ALTER INDEX ... REBUILD ONLINE NÃO é o caminho; use
--- DBMS_VECTOR.REBUILD_INDEX. Parâmetros NULL mantêm o valor atual do índice.
--- idx_rebuild_mode: 'FULL' | 'INCREMENTAL' (só HNSW); NULL = drop + recria.
-BEGIN
-  DBMS_VECTOR.REBUILD_INDEX(
-    idx_name            => 'IDX_DOC_FORENSE_HNSW',
-    table_name          => 'DOCUMENTOS_FORENSES',
-    idx_vector_col      => 'EMBEDDING',
-    idx_organization    => 'INMEMORY NEIGHBOR GRAPH',
-    idx_distance_metric => 'COSINE',
-    idx_accuracy        => 95,
-    idx_parameters      => '{"type" : "HNSW", "neighbors" : 32, "efConstruction" : 200}',
-    idx_rebuild_mode    => 'FULL'
-    -- 26ai 23.26.1+: idx_online_build => TRUE para reconstruir online
-  );
-END;
-/
 
+
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_ivf_online;
 
 -- 26ai 23.26.1+ — HNSW com SCALAR QUANTIZATION (reduz memória do grafo)
 -- Combinações válidas (formato da coluna → tipo guardado no índice):
@@ -308,6 +312,23 @@ PARAMETERS (
   RESCORE FACTOR   2,
   ALGORITHM        UNIFORM_QUANTIZATION
 );
+
+-- 26ai — HNSW: ALTER INDEX ... REBUILD ONLINE NÃO é o caminho; use
+-- DBMS_VECTOR.REBUILD_INDEX. Parâmetros NULL (omitidos) mantêm o valor atual
+-- do índice. idx_rebuild_mode: 'FULL' | 'INCREMENTAL' (só HNSW).
+-- 26ai 23.26.1+: idx_online_build => TRUE para reconstruir online.
+BEGIN
+  DBMS_VECTOR.REBUILD_INDEX(
+    idx_name         => 'IDX_DOC_FORENSE_HNSW_SQ',
+    table_name       => 'DOCUMENTOS_FORENSES',
+    idx_vector_col   => 'EMBEDDING',
+    idx_rebuild_mode => 'FULL'
+  );
+END;
+/
+
+-- Uma coluna aceita UM índice vetorial (ORA-01408): remova antes de testar a próxima alternativa.
+DROP INDEX IF EXISTS idx_doc_forense_hnsw_sq;
 
 -- 26ai 23.26.4+ — HNSW com PRODUCT QUANTIZATION (compressão maior, 2..128)
 -- Só FLOAT32/FLOAT64; métricas EUCLIDEAN, EUCLIDEAN_SQUARED e COSINE.
@@ -382,7 +403,7 @@ END;
 /
 
 
--- 26ai — uso atual do Vector Memory Pool
+-- 26ai — uso atual do Vector Memory Pool (exige SELECT_CATALOG_ROLE ou DBA)
 SELECT con_id, pool,
        alloc_bytes / 1024 / 1024 AS alloc_mb,
        used_bytes  / 1024 / 1024 AS used_mb

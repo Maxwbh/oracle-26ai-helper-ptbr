@@ -93,8 +93,12 @@ Memória do HNSW, pela fórmula da doc ("Size the Vector Pool"): `1.3 × nº de 
 
 ## Vector Pool (vector_memory_size)
 
-- Default 0; range 0–70% da SGA; **dinâmico** (`ALTER SYSTEM … SCOPE=BOTH`) e modificável no PDB.
+- Default 0; range 0–70% da SGA; modificável no PDB.
 - No CDB: tamanho do pool. No PDB: cota máxima.
+- **CDB com pool 0 no startup:** aumentar exige `SCOPE=SPFILE` + restart (sem restart → ORA-51950).
+- **CDB com pool alocado no startup:** cresce dinamicamente; não reduz abaixo do valor inicial (ORA-51953).
+- **PDB:** cota dinâmica (`SCOPE=BOTH`), limitada ao pool do CDB (ORA-51955).
+- Medido no 26ai Free 23.26.3 (nov/2026). A doc lista o parâmetro como modificável por `ALTER SYSTEM`, mas não detalha essas restrições.
 - `1` com `sga_target > 0`: auto-sizing (on-prem desde 23.8).
 - HNSW mora no pool; IVF usa o pool só para acelerar a criação (sem espaço, centróides vão para a large pool).
 
@@ -136,7 +140,7 @@ Segurança: com **Deep Data Security** (23.26.2+) a autorização por linha/colu
 
 ## Edição Free
 
-O 26ai Free roda com 2 cores, 2 GB de RAM e 12 GB de dados de usuário. O Licensing Information User Manual 26ai **não** tem linha explícita para AI Vector Search no Free (**A VERIFICAR** no FAQ do Free); Oracle Machine Learning não exige licença extra. O Vector Pool precisa caber nos 2 GB. Tabela por template em `assets/README.md`.
+O 26ai Free roda com 2 cores, 2 GB de RAM e 12 GB de dados de usuário. **Testado em nov/2026** (imagem oficial, RU 23.26.3): modelo ONNX, embeddings, HNSW, IVF, quantização SCALAR, hybrid index e busca híbrida funcionam; quantização PRODUCT não, porque é 23.26.4+. O Licensing Information User Manual 26ai não tem linha explícita para AI Vector Search no Free; Oracle Machine Learning não exige licença extra. Tabela por template em `assets/README.md`.
 
 ## Documentação oficial
 

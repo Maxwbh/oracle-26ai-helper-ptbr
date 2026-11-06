@@ -56,8 +56,7 @@ CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW departamentos_dv AS
 departamentos @insert @update @delete {
   _id          : id_departamento,
   nome         : nome,
-  funcionarios : funcionarios @insert @update @delete
-                 @link (to : ["ID_DEPARTAMENTO"]) [{
+  funcionarios : funcionarios @insert @update @delete @link (to : ["ID_DEPARTAMENTO"]) [{
     idFuncionario : id_funcionario,
     nome          : nome
   }]
@@ -67,6 +66,7 @@ departamentos @insert @update @delete {
 - `@link(to: [...])` aponta a FK na tabela **aninhada** (um-para-muitos); `@link(from: [...])` aponta a FK na tabela **externa** (um-para-um).
 - O `@link` só é obrigatório quando há mais de uma FK entre as duas tabelas ou FK para a própria tabela.
 - Os exemplos da doc usam o nome da coluna em maiúsculas.
+- **SQL*Plus/SQLcl:** linha que começa com `@` é executada como script (`SP2-0310`). Mantenha as diretivas na mesma linha do campo — verificado no 26ai Free 23.26.3.
 
 ## Anotações e diretivas
 

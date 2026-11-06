@@ -5,6 +5,7 @@
 --        nova tentativa com backoff, registro de conflitos, SYS_ROW_ETAG.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — sem erros (consultas V$ exigem SELECT_CATALOG_ROLE)
 -- Tipo: Executável — depende das tabelas de json_duality_view_basics.sql
 -- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
@@ -53,10 +54,8 @@ SELECT JSON {
   '_id'         : d.id_departamento,
   'nome'        : d.nome,
   'localizacao' : d.localizacao,
-
   -- Campo de auditoria: muda sem afetar o ETAG
   'ultimaConsulta': d.ultima_consulta WITH NOCHECK,
-
   -- Sub-array central: participa do ETAG normalmente
   'funcionarios': [
     SELECT JSON {
@@ -359,9 +358,15 @@ END;
 --==============================================================================
 
 -- Passo 1: ler o ETAG das colunas que não podem mudar concorrentemente
-SELECT SYS_ROW_ETAG(nome, localizacao) AS etag
-  FROM departamentos
- WHERE id_departamento = 1;
+-- (SQL*Plus/SQLcl: guardado numa variável de ligação)
+VARIABLE etag_lido VARCHAR2(64)
+BEGIN
+  SELECT SYS_ROW_ETAG(nome, localizacao)
+    INTO :etag_lido
+    FROM departamentos
+   WHERE id_departamento = 1;
+END;
+/
 
 -- Passo 2: atualizar só se o ETAG ainda for o mesmo (0 linhas = conflito)
 UPDATE departamentos
@@ -374,6 +379,8 @@ UPDATE departamentos
 -- 5. Sessões e transações em atividade sobre duality views
 --==============================================================================
 
+-- Requer SELECT_CATALOG_ROLE (ou rodar como DBA): o usuário da aplicação
+-- não enxerga V$SESSION/V$SQL/V$TRANSACTION (ORA-00942).
 -- Sessões ativas executando UPDATE em views com sufixo _DV (convenção local)
 SELECT s.sid, s.serial#, s.username, s.event,
        SUBSTR(q.sql_text, 1, 100) AS sql_inicio

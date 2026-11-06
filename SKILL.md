@@ -2,7 +2,7 @@
 name: oracle-26ai-helper-ptbr
 description: "Aprofundamento em Oracle AI Database 26ai (23.26.x) — AI Vector Search, JSON Relational Duality, RAFT replication e migração 19c→26ai, com templates SQL/PL/SQL em PT-BR. ATIVE em VECTOR, VECTOR_DISTANCE, VECTOR_EMBEDDING, HNSW, IVF, vector_memory_size, ONNX, DBMS_VECTOR, DBMS_VECTOR_CHAIN, DBMS_HYBRID_VECTOR, hybrid vector index, RAG, UTL_TO_CHUNKS, quantização, duality view, ETag, ORA-42699, @nocheck, @link, GRAPHQL(), MongoDB API, Globally Distributed Database, RAFT, replication unit, GDSCTL, AutoUpgrade para 26ai, Deep Data Security, Private Agent Factory, Deep NL2SQL. Frases — 'busca semântica no banco', 'RAG em PL/SQL', 'HNSW ou IVF?', 'duality view dept emp', 'ORA-42699 em produção', 'RAFT funciona no Free?', 'planejar migração 19c pro 26ai'. NÃO ATIVE em Oracle 19c, PL/SQL ou SQL sem essas features (oracle-plsql-ptbr), sintaxe nova genérica do 26ai (oracle-26ai-ptbr), APEX (oracle-apex-ptbr), instalar banco local (oracle-lab-ptbr), nem vector DB ou JSON fora do Oracle (Pinecone, MongoDB nativo)."
 metadata:
-  version: 1.1.0
+  version: 1.1.1
   release_date: 2026-11-06
   repository: https://github.com/Maxwbh/oracle-26ai-helper-ptbr
   suite_size: 20
@@ -42,7 +42,7 @@ Muita coisa chegou num RU específico (HNSW ONLINE e quantização em 23.26.1, D
 1. **SQL puro antes de PL/SQL.** `VECTOR_DISTANCE` e `INSERT … SELECT VECTOR_EMBEDDING(…)` em vez de loop linha a linha.
 2. **Bind variables sempre**, inclusive para vetores.
 3. **NOCOPY em parâmetros IN OUT grandes** (VECTOR, CLOB, coleções).
-4. **Vector Pool dimensionado antes do HNSW.** `vector_memory_size` é dinâmico (`SCOPE=BOTH`), mas sem pool não há HNSW. Use `DBMS_VECTOR.INDEX_VECTOR_MEMORY_ADVISOR` em vez de chute.
+4. **Vector Pool dimensionado antes do HNSW.** No CDB, se o pool está em 0, ligar exige `SCOPE=SPFILE` + restart (ORA-51950); depois cresce sem restart. No PDB a cota é dinâmica e limitada ao CDB. Sem pool não há HNSW. Use `DBMS_VECTOR.INDEX_VECTOR_MEMORY_ADVISOR` em vez de chute.
 5. **ETag no UPDATE de documento completo em duality view.** Envie `_metadata.etag` e trate ORA-42699 com retry. Não existe regra de ordem de campos.
 6. **Não invente sintaxe.** Pacotes de IA mudam por RU; se não estiver na reference, consulte a doc 26ai ou diga que não sabe.
 7. **Naming Trivadis 4.4:** prefixos em inglês (`g_`, `gc_`, `l_`, `lc_`, `p_`, `r_`, `t_`, `co_`, `e_`), nomes em PT-BR, keywords e pacotes Oracle em inglês. Revisão de padrão → `oracle-trivadis-ptbr`.
@@ -79,7 +79,7 @@ Muita coisa chegou num RU específico (HNSW ONLINE e quantização em 23.26.1, D
 | Antipattern | Correção |
 |---|---|
 | `CREATE INDEX` comum em coluna VECTOR | `CREATE VECTOR INDEX … ORGANIZATION INMEMORY NEIGHBOR GRAPH` (HNSW) ou `NEIGHBOR PARTITIONS` (IVF) |
-| HNSW sem Vector Pool | `ALTER SYSTEM SET vector_memory_size = … SCOPE=BOTH` (dinâmico) |
+| HNSW sem Vector Pool | CDB: `vector_memory_size` com `SCOPE=SPFILE` + restart (se estava em 0); PDB: cota com `SCOPE=BOTH` |
 | `ALTER INDEX … REBUILD` em HNSW | `DBMS_VECTOR.REBUILD_INDEX` (ALTER INDEX só em IVF) |
 | `DBMS_VECTOR.GENERATE` | Não existe; use `UTL_TO_GENERATE_TEXT` |
 | Credencial OpenAI com chaves OCI | OpenAI usa `{"access_token": …}`; chaves OCI são do `ocigenai` |
@@ -88,6 +88,7 @@ Muita coisa chegou num RU específico (HNSW ONLINE e quantização em 23.26.1, D
 | Embeddings em VARCHAR2 | Tipo `VECTOR` nativo |
 | Loop PL/SQL gerando embedding linha a linha | `INSERT … SELECT VECTOR_EMBEDDING(…)` ou `UTL_TO_EMBEDDINGS` |
 | `add ru` / `failover ru` no GDSCTL | Comandos inexistentes; as RUs nascem no deploy e o failover é automático |
+| Script para SQL*Plus/SQLcl com `;` seguido de comentário, linha em branco dentro de comando SQL ou linha começando com `@` | O comando é descartado (às vezes sem erro). Comentário na linha de cima, sem linhas em branco dentro do comando, diretiva `@` na mesma linha do campo |
 
 ## Operações de risco
 

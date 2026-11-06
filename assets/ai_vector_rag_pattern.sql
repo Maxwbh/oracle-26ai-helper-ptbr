@@ -17,6 +17,7 @@
 -- → LLM responde citando os chunks.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — retrieval e auditoria OK; geração não testada (sem credencial OCI)
 -- Tipo: Dependente de configuração — LLM externo (OCI Generative AI) com ACL e credencial
 -- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: Parcial — retrieval (seções 2-3) roda no Free; a geração

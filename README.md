@@ -2,7 +2,7 @@
 
 Skill em português brasileiro para [Claude](https://claude.ai) com **aprofundamento em Oracle AI Database 26ai**: AI Vector Search, JSON Relational Duality (com GraphQL), RAFT replication e migração 19c → 26ai.
 
-Versão atual: **1.1.0** (novembro/2026) — revisada contra a documentação Oracle AI Database 26ai, RU 23.26.4.
+Versão atual: **1.1.1** (novembro/2026) — revisada contra a documentação Oracle AI Database 26ai (RU 23.26.4) e testada no 26ai Free 23.26.3.
 
 ## Onde esta skill se encaixa
 
@@ -44,7 +44,7 @@ Em **Oracle 19c** as features desta skill não existem. Use a suíte.
 1. **SQL puro antes de PL/SQL.**
 2. **Bind variables sempre**, inclusive para vetores.
 3. **NOCOPY em parâmetros IN OUT grandes.**
-4. **Vector Pool dimensionado antes do HNSW.** `vector_memory_size` é dinâmico.
+4. **Vector Pool dimensionado antes do HNSW.** No CDB, ligar o pool (de 0) exige restart; depois cresce sem restart.
 5. **ETag no UPDATE de documento completo em duality view**; trate ORA-42699.
 6. **Não invente sintaxe.**
 7. **Naming Trivadis 4.4:** prefixos em inglês, nomes em PT-BR.
@@ -120,6 +120,7 @@ oracle-26ai-helper-ptbr/
 
 | Versão | Mudanças principais |
 |---|---|
+| **1.1.1** (nov/2026) | Teste de integração no 26ai Free 23.26.3: correções de SQL*Plus, Vector Pool, privilégios e exemplos executáveis; validador e script de teste local. |
 | **1.1.0** (nov/2026) | Revisão contra a doc 26ai RU 23.26.4; correção de sintaxe inventada em Vector, Duality e RAFT; tabela Free; ecossistema de IA; integração com a suíte oracle-skills-ptbr. Detalhes em `CHANGELOG.md`. |
 | **v1** (abr/2026) | Versão inicial |
 

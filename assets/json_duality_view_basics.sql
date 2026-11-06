@@ -6,6 +6,7 @@
 --        anotações de DML e exposição via REST (ORDS) / MongoDB API.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — sem erros
 -- Tipo: Executável — cria as próprias tabelas de exemplo
 -- RU mínimo: 23.26.0 (GRAPHQL()); validation directives 23.26.2+; array limits 23.26.3+
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
@@ -106,8 +107,9 @@ departamentos @insert @update @delete {
   _id          : id_departamento,
   nome         : nome,
   localizacao  : localizacao,
-  funcionarios : funcionarios @insert @update @delete
-                              @link (to: ["ID_DEPARTAMENTO"]) [{
+  -- Atenção: no SQL*Plus/SQLcl uma linha que COMEÇA com "@" é executada como
+  -- script. Mantenha as diretivas na mesma linha do nome do campo.
+  funcionarios : funcionarios @insert @update @delete @link (to: ["ID_DEPARTAMENTO"]) [{
     idFuncionario : id_funcionario,
     nome          : nome,
     cargo         : cargo,
@@ -305,6 +307,7 @@ NOINSERT NOUPDATE NODELETE para todas as cláusulas FROM.
 
 -- Exemplo: departamento editável; funcionários somente leitura via esta view
 -- (mudanças em funcionários são feitas em outra view ou direto na tabela)
+-- sem DELETE: ver regra da FK acima
 CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW dept_readonly_func_dv AS
 SELECT JSON {
   '_id'         : d.id_departamento,
@@ -319,7 +322,7 @@ SELECT JSON {
      WHERE d.id_departamento = f.id_departamento
   ]
 }
-  FROM departamentos d WITH INSERT UPDATE;  -- sem DELETE: ver regra da FK acima
+  FROM departamentos d WITH INSERT UPDATE;
 
 
 --==============================================================================

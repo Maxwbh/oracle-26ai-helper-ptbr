@@ -8,6 +8,7 @@
 --                Em 19c não funciona — VECTOR e VECTOR_EMBEDDING não existem.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — sem erros (ONNX all_MiniLM_L12_v2 oficial)
 -- Tipo: Dependente de configuração — exige o arquivo ONNX no servidor (DIRECTORY) e Vector Pool para HNSW
 -- RU mínimo: 23.26.0 (qualquer 26ai); blocos de RU específico marcados no código
 -- Edição Free: Parcial — VECTOR, ONNX e busca exata cabem no Free, mas o guia
@@ -32,9 +33,12 @@
 -- índices HNSW (o grafo fica inteiro no pool) e acelera criação/DML de IVF
 -- (centróides em cache; se faltar espaço, vão para o large pool).
 --
--- VECTOR_MEMORY_SIZE é DINÂMICO — não precisa reiniciar a instância:
---   - no CDB: tamanho do vector pool da instância (reduzir falha se houver uso)
---   - no PDB: cota máxima de uso do pool por aquele PDB
+-- Comportamento medido no 26ai Free 23.26.3 (nov/2026):
+--   - CDB com pool 0 no startup: aumentar exige SCOPE=SPFILE + restart
+--     (sem restart → ORA-51950 "cannot be increased")
+--   - CDB com pool alocado no startup: CRESCE dinamicamente; não reduz abaixo
+--     do valor inicial (ORA-51953); um resize de cada vez (ORA-51957)
+--   - PDB: cota dinâmica (SCOPE=BOTH), limitada ao pool do CDB (ORA-51955)
 --==============================================================================
 
 -- 26ai
@@ -50,8 +54,16 @@ SELECT name, ispdb_modifiable
   FROM v$system_parameter
  WHERE name = 'vector_memory_size';
 
--- Conectado no PDB (define a cota do PDB) — vale na hora e persiste no SPFILE
-ALTER SYSTEM SET vector_memory_size = 512M SCOPE = BOTH;
+-- Passo 1 — no CDB$ROOT (só se o pool estiver em 0): grava no SPFILE e
+-- reinicia a instância. Em produção, planeje a janela.
+--   ALTER SESSION SET CONTAINER = CDB$ROOT;
+--   ALTER SYSTEM SET vector_memory_size = 512M SCOPE = SPFILE;
+--   SHUTDOWN IMMEDIATE
+--   STARTUP
+--   ALTER PLUGGABLE DATABASE ALL OPEN;
+
+-- Passo 2 — conectado no PDB: cota do PDB (dinâmica, ≤ pool do CDB)
+ALTER SYSTEM SET vector_memory_size = 256M SCOPE = BOTH;
 
 -- 26ai (23ai 23.8+): alternativa de pool auto-gerenciado —
 -- VECTOR_MEMORY_SIZE = 1 no CDB com SGA_TARGET > 0 na inicialização faz o pool
@@ -75,7 +87,16 @@ SELECT con_id, pool,
 -- 2. Setup do schema de exploração (executar uma vez, como SYS no PDB)
 --==============================================================================
 
-CREATE BIGFILE TABLESPACE tbs_vector DATAFILE SIZE 256M AUTOEXTEND ON MAXSIZE 2G;
+-- Tablespace dedicado. "DATAFILE SIZE" sem caminho exige OMF
+-- (DB_CREATE_FILE_DEST definido); sem OMF → ORA-02236. No container do 26ai
+-- Free o OMF vem vazio: informe o caminho do arquivo.
+--   SELECT value FROM v$parameter WHERE name = 'db_create_file_dest';
+-- Com OMF:
+--   CREATE BIGFILE TABLESPACE tbs_vector DATAFILE SIZE 256M AUTOEXTEND ON MAXSIZE 2G;
+-- Sem OMF (caminho do container 26ai Free; ajuste ao seu ambiente):
+CREATE BIGFILE TABLESPACE tbs_vector
+  DATAFILE '/opt/oracle/oradata/FREE/FREEPDB1/tbs_vector01.dbf'
+  SIZE 256M AUTOEXTEND ON MAXSIZE 2G;
 
 -- Senha: NUNCA fica no script. Informe em tempo de execução (SQLcl/SQL*Plus)
 -- ou use o cofre de senhas do ambiente. Não reaproveite este usuário fora do
@@ -91,9 +112,10 @@ UNDEFINE senha_usuario_vetor
 
 -- Privilégios MÍNIMOS para este template (tabelas, índices no próprio schema,
 -- packages/procedures e o modelo ONNX)
+-- exigido para LOAD_ONNX_MODEL
 GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW,
       CREATE SEQUENCE, CREATE PROCEDURE TO usuario_vetor;
-GRANT CREATE MINING MODEL TO usuario_vetor;    -- exigido para LOAD_ONNX_MODEL
+GRANT CREATE MINING MODEL TO usuario_vetor;
 -- Alternativa só para laboratório pessoal: DB_DEVELOPER_ROLE (23ai+) concede
 -- bem mais do que este template precisa — evite em ambientes compartilhados.
 
@@ -170,6 +192,23 @@ VALUES (
   VECTOR_EMBEDDING(modelo_minilm_l12 USING
     'Vítima do sexo masculino, 45 anos, óbito por trauma craniano contuso' AS data)
 );
+
+-- Tabela de origem do exemplo (em produção, a tabela do sistema legado)
+CREATE TABLE laudos_origem (
+  id_origem         NUMBER        NOT NULL,
+  titulo_origem     VARCHAR2(200) NOT NULL,
+  conteudo_origem   CLOB          NOT NULL,
+  categoria_origem  VARCHAR2(50),
+  data_criacao      DATE          DEFAULT SYSDATE NOT NULL,
+  CONSTRAINT pk_laudos_origem PRIMARY KEY (id_origem)
+);
+
+INSERT INTO laudos_origem (id_origem, titulo_origem, conteudo_origem, categoria_origem)
+VALUES (101, 'Laudo 101', 'Lesão corporal por instrumento contundente em membro superior.', 'LESAO');
+INSERT INTO laudos_origem (id_origem, titulo_origem, conteudo_origem, categoria_origem)
+VALUES (102, 'Laudo 102', 'Óbito por intoxicação exógena; presença de opioides no sangue.', 'TOXICOLOGIA');
+INSERT INTO laudos_origem (id_origem, titulo_origem, conteudo_origem, categoria_origem)
+VALUES (103, 'Laudo 103', 'Ferimento por projétil de arma de fogo com orifício de entrada no tórax.', 'OBITO');
 
 -- 26ai — bulk: gerar embeddings para múltiplas linhas (SQL puro)
 -- Para textos longos, fatie antes (ver ai_vector_embedding_pipeline.sql):
