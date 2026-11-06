@@ -1,129 +1,101 @@
 # Migração Oracle 19c → 26ai — Reference
 
-Conceitos e considerações para upgrade.
+Conceitos e considerações para upgrade. Revisado em nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4). Itens sem fonte confirmada estão marcados **A VERIFICAR**.
 
-## Status do release (abril 2026)
+> Escopo nesta skill: visão de planejamento para quem vai usar Vector Search, JSON Duality e RAFT depois do upgrade. Checklist de código e sintaxe nova → `oracle-26ai-ptbr`; operação do upgrade (RMAN, Data Guard, PDB) → `oracle-dba-ptbr`; laboratório local 26ai Free → `oracle-lab-ptbr`. Suíte: https://github.com/Maxwbh/oracle-skills-ptbr
 
-- **Oracle AI Database 26ai EE Linux x86-64**: GA desde 27/janeiro/2026 (versão técnica 23.26.1)
-- **Outras plataformas (Windows, AIX)**: previstas ao longo de 2026
-- **Standard Edition 2 (SE2)**: ainda sem data definida
-- **Oracle 19c**: Premier Support encerrou 30/04/2024; Extended Support até 30/04/2027; ESS até 30/04/2030
+## Índice
 
-Há tempo para planejar com cuidado, mas não infinito.
+- [Status do release (nov/2026)](#status-do-release-nov2026)
+- [Caminho de upgrade](#caminho-de-upgrade)
+- [Mudanças arquiteturais obrigatórias](#mudanças-arquiteturais-obrigatórias)
+- [AutoUpgrade — ferramenta canônica](#autoupgrade--ferramenta-canônica)
+- [Roteiro de migração — fases](#roteiro-de-migração--fases)
+- [Riscos principais](#riscos-principais)
+- [APEX após upgrade](#apex-após-upgrade)
+- [Recomendação para ambientes sem cronograma definido](#recomendação-para-ambientes-sem-cronograma-definido)
+- [Documentação e fontes](#documentação-e-fontes)
+
+## Status do release (nov/2026)
+
+| Item | Situação | Fonte |
+|---|---|---|
+| 26ai EE on-prem Linux x86-64 | GA em **27/01/2026**, RU 23.26.1 | Mike Dietrich, 27/01/2026 |
+| RU atual | **23.26.4** (out/2026); anteriores 23.26.0 out/2025, 23.26.1 jan, 23.26.2 abr, 23.26.3 jul/2026 | AI Vector Search User's Guide 26ai (What's New por RU) |
+| Outras plataformas | IBM AIX, zLinux, Windows previstos para 2027; SPARC Solaris e Linux ARM **não planejados** | Mike Dietrich, 01/10/2026 |
+| Standard Edition 2 | **A VERIFICAR** — fontes de terceiros divergem (jul/2026 × out/2026) | — |
+| 26ai Free | Disponível (Linux x86-64, ARM, Windows); 2 cores, 2 GB RAM, 12 GB de dados | Free Installation Guide 26ai — Licensing Restrictions |
+| 19c | Premier Support até **31/12/2029**; Extended de 01/01/2030 a **31/12/2032** | Mike Dietrich, 20/11/2024 (confirme no MOS 742060.1) |
 
 ## Caminho de upgrade
 
-✓ **Direto 19c → 26ai**: suportado oficialmente, sem etapa intermediária
-✗ 11g → 26ai: precisa upgrade para 19c primeiro
-✗ 12c → 26ai: idem, via 19c
-
-Para clientes que já estão em 23ai cloud/Engineered: aplicar Release Update 23.26.1 (não é upgrade, é patch).
+- ✓ **Direto para 26ai:** a partir de **19c e 21c** (todas as releases) — Upgrade Guide 26ai, "Oracle Database Releases That Support Direct Upgrade".
+- ✗ Anterior a 19c: passa por 19c/21c primeiro (ex.: `11.2.0.4 → 19c → 26ai`; `10.2 → 12.2 → 19c → 26ai`).
+- **23ai → 26ai:** aplicação de RU (patch), não upgrade completo (oracle-base, "Upgrade Overview").
 
 ## Mudanças arquiteturais obrigatórias
 
 ### Multitenant compulsório
 
-Non-CDB foi **descontinuado** em 26ai. Toda instalação 26ai é CDB com 1+ PDBs.
+Non-CDB é desuportado (desde 21c, segundo oracle-base); não existe 26ai non-CDB. Todo 19c non-CDB vira PDB num CDB 26ai.
 
-Implicações para 19c non-CDB:
-- AutoUpgrade converte automaticamente para PDB durante o processo
-- Connection strings mudam: agora apontam para PDB, não para SID
-- tnsnames.ora dos clientes precisa atualização
-- Aplicações com connection pool (Java, .NET, ORDS): reconfigurar
+Implicações:
+- AutoUpgrade converte para PDB durante o processo (ou Replay Upgrade ao plugar)
+- Connection strings passam a apontar para o serviço da PDB
+- `tnsnames.ora` dos clientes e pools de conexão (Java, .NET, ORDS) precisam ser revistos
+- Limite de PDBs por CDB depende de edição/licença — **A VERIFICAR** no Licensing Information User Manual 26ai
 
-Em 26ai:
-- Default `MAX_PDB_PER_CDB`: 252
-- Recomendação: 1 PDB por banco existente (preserva isolamento)
-- Múltiplos ambientes (dev/homo/prod) num único CDB: opcional, traz consolidação mas exige cuidado com resource management
+### Vector Pool
 
-### Vector Memory Pool
+Para índices HNSW, dimensione o Vector Pool:
 
-Para usar HNSW vector indexes:
 ```sql
-ALTER SYSTEM SET vector_memory_size = 8G SCOPE = SPFILE;
--- restart obrigatório
+-- 26ai — parâmetro dinâmico; no CDB = tamanho do pool, no PDB = cota
+ALTER SYSTEM SET vector_memory_size = 1G SCOPE = BOTH;
 ```
 
-Sem isso, HNSW disputa shared pool e falha. Não habilita por default.
+Default 0, range 0–70% da SGA, modificável no PDB. Valor `1` com `sga_target > 0` ativa o auto-sizing (23.8+). Não há parâmetro para "ligar" Vector Search ou Duality Views.
 
 ## AutoUpgrade — ferramenta canônica
 
-Java-based, incluído em `$ORACLE_HOME/rdbms/admin/autoupgrade.jar`. Versão atual recomendada: 25.6+.
-
-Modos:
-1. **ANALYZE**: identifica issues sem alterar nada
-2. **FIXUPS**: aplica correções pré-upgrade automatizáveis
-3. **DEPLOY**: executa upgrade completo
-
-Capacidades:
-- Pre-upgrade analysis exaustivo
-- Conversão non-CDB → PDB
-- Multi-target (vários databases numa execução)
-- Resumível e com rollback
+- Baixe sempre o mais recente (MOS 2485457.1) em vez de usar o do `ORACLE_HOME`. Mais recente em nov/2026: **26.6** (build 26.6.260925).
+- Modos: `-mode analyze` → `fixups` → `deploy`.
+- Capacidades: análise pré-upgrade, conversão non-CDB → PDB, vários bancos numa execução, retomada após falha, fallback por restore point garantido.
+- A Oracle lista também **Replay Upgrade** (upgrade ao plugar) e Enterprise Manager (exige Lifecycle Management Pack).
 
 ## Roteiro de migração — fases
 
-### Fase 1: Preparação (semanas)
-- Inventário completo de bancos e suas características (RAC, ADG, partitioning, custom features)
-- Provisionar 26ai em ambiente de teste
-- AutoUpgrade ANALYZE em clone do prod
-- Classificar issues: auto-fixable, manual, bloqueador
-- Documentar plano de rollback
+| Fase | Duração típica | O que fazer |
+|---|---|---|
+| 1. Preparação | semanas | Inventário (RAC, ADG, partitioning); 26ai em teste; AutoUpgrade ANALYZE num clone de produção; classificar issues; plano de fallback |
+| 2. Certificação | semanas | Testar cada aplicação; APEX: páginas críticas; REST/SOAP; utPLSQL; comparar planos com 19c |
+| 3. Treinamento | — | DBA em multitenant e Vector Pool; DEV nas features novas; comunicação da janela |
+| 4. Não-prod | 1–2 semanas por ambiente | DEV, depois HOMO; medir tempos reais |
+| 5. Produção | janela | Backup com restore validado; standby primeiro se houver ADG; DEPLOY monitorado; smoke tests; monitoração 24–72 h |
+| 6. Pós-upgrade | semanas | AWR × baseline 19c; SQL Plan Management para regressões; adotar Vector/Duality aos poucos |
 
-### Fase 2: Certificação de aplicações (semanas)
-- Identificar todas as aplicações dependentes
-- Para cada app: testar funcionamento em 26ai
-- APEX apps: testar pages críticas em produção
-- Integrações REST/SOAP: testar endpoints
-- PL/SQL crítico: rodar test suite (utPLSQL)
-- Performance: comparar plans com 19c
-
-### Fase 3: Treinamento e comunicação
-- DBA: treinar em multitenant, vector pool, novas features
-- DEV: avisar sobre features novas (não obrigatórias inicialmente)
-- Stakeholders: janela de manutenção, comunicação de mudança
-
-### Fase 4: Upgrade em ambientes não-prod
-- DEV primeiro
-- HOMO depois (com data real ou anonimizada)
-- 1-2 semanas de validação em cada
-- Documentar tempos reais e issues
-
-### Fase 5: Upgrade prod
-- Backup completo verificado (restore validado, não apenas RMAN status)
-- Janela de manutenção comunicada com antecedência
-- Standby (ADG) atualizado primeiro se aplicável
-- AutoUpgrade DEPLOY com monitoramento ativo
-- Smoke tests imediatamente pós-upgrade
-- Monitoring intensivo nas primeiras 24-72h
-
-### Fase 6: Pós-upgrade (semanas)
-- Coletar AWR, comparar com baseline 19c
-- SQL Plan Management para fixar plans regressivos
-- Habilitar features 26ai gradualmente (vector search, duality)
-- Documentar lessons learned
+As durações são estimativas de planejamento, não números da Oracle.
 
 ## Riscos principais
 
-| Risco | Probabilidade | Mitigação |
-|---|---|---|
-| AutoUpgrade falha no meio | Baixa | Rollback automático testado em homo |
-| Plans piores em 26ai | Média | SQL Plan Management; baseline em 19c |
-| Connection string quebra cliente | Alta | Manter alias tnsnames durante transição |
-| PL/SQL com features deprecated | Média | ANALYZE detecta; FIXUPS resolve grande parte |
-| Performance regression específica | Média | Testes de performance em homo; manter 19c rollback |
-| Time DBA inexperiente em multitenant | Alta | Treinamento ANTES do upgrade |
+| Risco | Mitigação |
+|---|---|
+| AutoUpgrade falha no meio | Fallback testado em homo (restore point garantido ou backup com restore validado) |
+| Planos piores no 26ai | SQL Plan Management com baseline capturada no 19c; estatísticas completas pós-upgrade |
+| Connection string quebra cliente | Comunicação prévia; alias em `tnsnames` durante a transição |
+| PL/SQL com recursos desuportados | ANALYZE detecta; FIXUPS resolve parte; refatorar o resto |
+| SGA insuficiente | RU 23.26.3 pode exigir SGA maior que releases anteriores (Mike Dietrich, 14/10/2026) |
+| Time sem experiência em multitenant | Treinamento antes do upgrade |
 
 ## APEX após upgrade
 
-APEX em 26ai = **APEX 24.2.11** (não há APEX 26 ainda).
-
-- AutoUpgrade do BD para 26ai inclui APEX automaticamente
-- Schema APEX_240200 permanece o mesmo
-- Apps existentes continuam funcionando sem modificação
-- APEX 26.1 será release update separado quando GA (previsto fim 2026/início 2027)
+- O APEX instalado no 19c sobe com o banco; a versão do APEX não muda por causa do upgrade.
+- APEX 26.1 (GA mai/2026) e 26.2 (GA 06/10/2026) já existem. O 26.2 exige banco 19c RU 19.18+ ou 26ai (release notes 26.2).
+- Se o AutoUpgrade trata o componente APEX automaticamente: **A VERIFICAR**.
+- Decisão e detalhes de versão: `oracle-apex-ptbr`.
 
 Validação pós-upgrade:
+
 ```sql
 SELECT comp_id, version, status
   FROM dba_registry
@@ -132,19 +104,20 @@ SELECT comp_id, version, status
 
 ## Recomendação para ambientes sem cronograma definido
 
-Conforme conversa: sem data definida para migração. Recomendação:
+1. Suba o **26ai Free** em VM ou container (sem custo; ver `oracle-lab-ptbr`).
+2. Explore Vector Search e JSON Duality em ambiente isolado (esta skill).
+3. Com projeto concreto, comece pela Fase 1.
+4. Com 19c em Premier Support até 2029, há margem — use-a para certificar, não para adiar.
 
-1. Provisionar 26ai Free Developer Release em VM/container (sem custo)
-2. Explorar Vector Search e JSON Duality em ambiente isolado (esta skill cobre)
-3. Quando houver projeto concreto, planejar Fase 1 acima
-4. Considerar contratação Oracle ACS para primeiro upgrade prod (reduz risco)
-
-19c Extended Support até abril/2027 dá margem confortável.
-
-## Documentação
+## Documentação e fontes
 
 - Upgrade Guide 26ai: https://docs.oracle.com/en/database/oracle/oracle-database/26/upgrd/
-- AutoUpgrade User's Guide: dentro do upgrade guide acima
-- MOS Notes: 884522.1 (NLS), 1645862.1 (AutoUpgrade Best Practices), 2485457.1 (latest build), 742060.1 (release schedule)
-- Blog Mike Dietrich (Upgrade Product Manager): https://mikedietrichde.com
-- LiveLabs: "Upgrade to Oracle Database 26ai with AutoUpgrade"
+- Releases com upgrade direto: https://docs.oracle.com/en/database/oracle/oracle-database/26/upgrd/oracle-database-releases-that-support-direct-upgrade.html
+- Conversão non-CDB: https://docs.oracle.com/en/database/oracle/oracle-database/26/upgrd/overview-converting-databases-during-upgrade.html
+- oracle-base, Upgrade Overview 26ai: https://oracle-base.com/articles/26/oracle-26-upgrade-overview
+- GA on-prem: https://mikedietrichde.com/2026/01/27/its-there-oracle-ai-database-26ai-is-available-for-download/
+- Plataformas: https://mikedietrichde.com/2026/10/01/oracle-ai-database-26ai-isnt-planned-for-sparc-solaris-and-linux-arm/
+- Suporte 19c: https://mikedietrichde.com/2024/11/20/important-update-to-oracle-database-19c-support-timelines/
+- AutoUpgrade 26.6: https://mikedietrichde.com/2026/09/30/new-autoupgrade-version-26-6-is-available/
+- SGA no 23.26.3: https://mikedietrichde.com/2026/10/14/oracle-23-26-3-may-require-a-larger-sga-than-previous-releases/
+- MOS (login): 2485457.1 (AutoUpgrade), 742060.1 (release schedule)

@@ -1,153 +1,160 @@
 # RAFT Globally Distributed Database — Reference
 
-Conceitos para Oracle AI Database 26ai. **Material exploratório** — RAFT em produção exige planejamento dedicado e tipicamente consultoria Oracle.
+Conceitos para Oracle AI Database 26ai. Revisado em nov/2026 contra o Globally Distributed Database Guide e a GDSCTL Reference 26ai. **Material exploratório**: RAFT em produção exige planejamento dedicado.
+
+## Índice
+
+- [Conceito-chave](#conceito-chave)
+- [Componentes](#componentes)
+- [Replication Unit (RU)](#replication-unit-ru)
+- [Habilitar RAFT](#habilitar-raft)
+- [Sharded vs Duplicated tables](#sharded-vs-duplicated-tables)
+- [GDSCTL — comandos de RU](#gdsctl--comandos-de-ru)
+- [Monitoração](#monitoração)
+- [Licenciamento e edição Free](#licenciamento-e-edição-free)
+- [Quando usar](#quando-usar)
+- [Novidades 26ai](#novidades-26ai)
+- [Roadmap exploratório](#roadmap-exploratório)
+- [Documentação](#documentação)
 
 ## Conceito-chave
 
-**Globally Distributed Database (GDD)** é a arquitetura de sharding nativa Oracle. **RAFT** é o protocolo de consenso distribuído usado para replicação multi-master entre shards.
+**Globally Distributed Database (GDD)** é a arquitetura de sharding nativa da Oracle. **Raft replication** é a replicação nativa por consenso entre shards, alternativa ao Data Guard dentro do GDD.
 
 Não confundir com:
-- **Oracle RAC**: cluster de instances compartilhando 1 storage; alta disponibilidade local
-- **Active Data Guard (ADG)**: 1 primary + N standbys read-only; DR e read scaling
-- **GoldenGate**: replicação heterogênea, eventual consistency
-- **GDD com RAFT**: múltiplas databases distribuídas, todas aceitando writes, consenso para consistência
+- **RAC:** várias instâncias sobre um storage compartilhado; alta disponibilidade local
+- **Active Data Guard:** primary + standbys; DR e escala de leitura
+- **GoldenGate:** replicação heterogênea com consistência eventual
 
 ## Componentes
 
 ```
-           ┌──────────────────┐
-           │  Shard Catalog   │ ← metadata da topologia
-           │  (separate DB)   │
-           └────────┬─────────┘
-                    │
-           ┌────────┴─────────┐
-           │       GSM        │ ← Global Service Manager (router)
-           │   (mid-tier)     │
-           └────────┬─────────┘
-                    │
-       ┌────────────┼────────────┐
-       │            │            │
-   ┌───▼───┐    ┌───▼───┐    ┌───▼───┐
-   │Shard 1│    │Shard 2│    │Shard 3│
-   │ (DB)  │    │ (DB)  │    │ (DB)  │
-   └───────┘    └───────┘    └───────┘
-   
-   Cada Shard hospeda 1+ Replication Units (RUs)
-   Cada RU tem 1 leader + N followers, replicação via RAFT
+Shard Catalog (banco de metadados)
+        │
+GSM — Global Service Manager (roteamento)
+        │
+ ┌──────┼──────┐
+Shard1 Shard2 Shard3   ← mínimo de 3 shards para Raft
+Cada shard hospeda réplicas de várias RUs; cada RU tem 1 leader + followers.
 ```
 
 ## Replication Unit (RU)
 
-Unidade lógica de replicação. Default em 26ai: 3 replicas (1 leader + 2 followers, quorum=2).
+- Conjunto de chunks replicados juntos; cada RU tem um **leader** e **followers**.
+- **Replication factor fixo em 3**, definido para o banco distribuído inteiro.
+- Heartbeat padrão de **150 ms**, com timeouts de eleição aleatórios; failover em menos de 3 s quando a latência de rede é baixa.
+- Commit por consenso: `SHARD_TXN_ACK_TIMEOUT_SEC` padrão de 90 s (estouro gera ORA-05086).
+- As RUs **nascem no `DEPLOY`**. Não existe comando `add ru`. A quantidade é definida antes do deploy.
+- Failover é **automático** (eleição Raft). Não existe `failover ru`. Depois que o nó volta, rebalanceie com `switchover ru -rebalance`.
 
-Eleição:
-- Heartbeat entre replicas (default: 1s)
-- Se leader não responde por timeout (default: 5s), followers iniciam eleição
-- Eleição: candidate solicita votos, ganha se majority concorda
-- Tempo típico de eleição: 3-5 segundos
+## Habilitar RAFT
 
-Garantias:
-- **Zero data loss** para writes que receberam ACK (quorum atingido)
-- **No split-brain** — apenas lado com quorum aceita writes
-- **Linearizability** — leituras vêem dados na ordem global de commit
+```bash
+# 26ai — -repl NATIVE liga o Raft; o default é DG e não pode ser alterado depois
+gdsctl create shardcatalog -database cat_host:1521/catpdb \
+       -user mysdbadmin/<senha> -repl native -sharding system \
+       -region regiao1,regiao2
+```
+
+A quantidade de RUs se define na criação (`-repunits n`) ou, antes do deploy, com `modify shardspace -shardspace <nome> -repunit n`. A grafia `-repunits` × `-repunit` diverge entre os guias; confira na GDSCTL Reference. O valor não muda depois do deploy.
 
 ## Sharded vs Duplicated tables
 
-| Tipo | Distribuição | Use case |
+| Tipo | Distribuição | Uso |
 |---|---|---|
-| `SHARDED TABLE` | Particionada por shard key | Tabelas grandes, dados de transação |
-| `DUPLICATED TABLE` | Replicada para todos shards | Reference data pequena (countries, status codes) |
+| `SHARDED TABLE` | Particionada pela sharding key | Tabelas grandes, transacionais |
+| `DUPLICATED TABLE` | Cópia em todos os shards | Dados de referência pequenos |
 
-Sharded:
 ```sql
-CREATE SHARDED TABLE clientes (...)
+-- 26ai (23ai+) — rodar no shard catalog
+CREATE SHARDED TABLE clientes (
+  id_cliente NUMBER        NOT NULL,
+  cpf        VARCHAR2(11)  NOT NULL,
+  nome       VARCHAR2(100),
+  CONSTRAINT pk_clientes PRIMARY KEY (id_cliente)
+)
 PARTITION BY CONSISTENT HASH (id_cliente)
 PARTITIONS AUTO
 TABLESPACE SET tbs_clientes;
-```
 
-Duplicated:
-```sql
 CREATE DUPLICATED TABLE estados (
-  uf VARCHAR2(2) PRIMARY KEY,
-  nome VARCHAR2(100)
+  uf   VARCHAR2(2)   NOT NULL,
+  nome VARCHAR2(100),
+  CONSTRAINT pk_estados PRIMARY KEY (uf)
 );
 ```
 
-## Sharding methods
+Métodos de sharding: system-managed (`CONSISTENT HASH`, padrão), user-defined e composite.
 
-| Método | Distribuição | Comentário |
-|---|---|---|
-| `CONSISTENT HASH` | Hash da chave | Recomendado default; rebalance gradual |
-| `RANGE` | Faixas de valor | Útil para temporais (mês/trimestre por shard) |
-| `LIST` | Valores enumerados | Geográfico (estado/região por shard) |
-| `COMPOSITE` | Combinação | Avançado, raro |
+## GDSCTL — comandos de RU
 
-## Quando usar GDD com RAFT
+| Comando | Uso |
+|---|---|
+| `status ru [-ru n] [-leaders] [-show_chunks] [-show_errors]` | Estado das RUs, leaders e lag |
+| `switchover ru -ru n -database <shard>` | Troca planejada de leader |
+| `switchover ru -rebalance` | Redistribui leaders depois de falha ou manutenção |
+| `move ru -ru n -source <shard> -target <shard>` | Move réplica follower |
+| `copy ru -ru n -source <a> -target <b> [-replace <c>]` | Recria réplica a partir de outra |
+| `relocate chunk -chunk <lista> -sourceru n [-targetru n]` | Move chunks entre RUs (`MOVE CHUNK` não é suportado com Raft) |
+| `remove ru -ru n` | Remove RU vazia |
+| `start ru` / `stop ru` / `sync ru -ru n` | Operação de réplica |
+| `set ru parameter NOME=valor` | Parâmetros de RU |
+| `config sdb` | Mostra "Replication Type Native" |
 
-✓ **Múltiplas regiões geográficas** (US-East + US-West + EU)
-✓ **Data sovereignty** (dados de cliente BR só em shards BR)
-✓ **Write scalability** além do que RAC fornece
-✓ **Active-active multi-master** com consistency strong
-✓ **Zero RPO** com automatic failover
+Comandos **inexistentes** citados na v1: `add ru`, `failover ru`, `config ru`, `add replica`, `remove replica`, `set ru priority`.
 
-✗ **Single datacenter**: RAC + ADG é mais simples e suficiente
-✗ **Workload pequeno** (<TB): overhead não compensa
-✗ **Schema complexo com muitos JOINs cross-shard**: latência mata performance
-✗ **Equipe sem expertise distribuída**: curva de aprendizado íngreme
+## Monitoração
 
-## Comparação com alternativas
+- `V$SHARD_REPLICATION_UNIT`: RU_ID, LEADER_ID, ROLE (1 = leader, 2 = follower, 3 = candidate), TERM, COMMITIDX
+- `SHARD_RAFT_PARAMETERS` (26ai)
+- `V$SHARD_ACK_SENDER`, `V$SHARD_ACK_RECEIVER`, `V$SHARD_APPLY_*`, `V$SHARD_LCR_*`, `V$SHARD_NETWORK_SENDER`, `V$SHARD_TRANSACTION`
+- Parâmetro `SHARD_ENABLE_RAFT_FOLLOWER_READ` (leitura em followers)
 
-| Necessidade | RAC | ADG | GoldenGate | GDD+RAFT |
-|---|---|---|---|---|
-| HA local | ✓✓✓ | ✓ | ✗ | ✓ |
-| DR remoto | ✗ | ✓✓✓ | ✓✓ | ✓✓✓ |
-| Multi-master writes | ✗ | ✗ | ✓ (com conflito) | ✓✓✓ |
-| Zero data loss | ✓ (mesmo storage) | ✓ (sync mode) | ✗ | ✓✓✓ |
-| Read scaling | ✗ | ✓✓ | ✓ | ✓✓ |
-| Geo-distribution | ✗ | ✓ | ✓✓ | ✓✓✓ |
-| Setup complexity | Médio | Baixo | Alto | Muito alto |
-| Custo licença | Médio | Médio | Alto | Muito alto |
+`GV$SHARDING_UNITS` **não existe** (citado na v1).
 
-## GDSCTL — comandos essenciais
+## Licenciamento e edição Free
 
-```bash
-# Conectar
-$ gdsctl connect gsmadmin/<senha>@gsm1
+Licensing Information User Manual 26ai, linha "Oracle Globally Distributed Database Raft Replication":
 
-# Status da topologia
-GDSCTL> status gsm
-GDSCTL> config shard
-GDSCTL> config region
-GDSCTL> config ru
+| Edição | Raft |
+|---|---|
+| **Free** | Permitido, até **3 nós**; cada nó dentro dos limites do Free (2 CPUs, 2 GB RAM, 12 GB de dados) |
+| SE2 | Não |
+| EE / EE-ES | Sim, sem limite de shards, mas **cada shard precisa de licença Oracle RAC** |
 
-# Eventos recentes
-GDSCTL> show events
+Sem Raft (GDD com Data Guard básico, sem ADG, GoldenGate ou RAC), o uso fica limitado a 3 shards primários.
 
-# Switchover planejado
-GDSCTL> switchover ru ru_name -newleader shard2
+## Quando usar
 
-# Adicionar shard
-GDSCTL> add shard -connect db.host:1521/sid -shardgroup sg_brasil
+✓ Várias regiões geográficas ou exigência de soberania de dados
+✓ Escala de escrita além do que um RAC entrega
+✓ RPO zero com failover automático entre shards
 
-# Validar
-GDSCTL> validate
-```
+✗ Um só datacenter: RAC + Data Guard é mais simples
+✗ Schema com muitos JOINs entre shards
+✗ Equipe sem experiência em sistemas distribuídos
+
+## Novidades 26ai
+
+| RU | Novidade |
+|---|---|
+| 23.26.0 | Mover chunks entre shardspaces |
+| 23.26.4 | Replicação assíncrona entre regiões para GDD com Raft; Witness Replica |
+
+Sintaxe das novidades do 23.26.4: consulte o guia antes de gerar código (**A VERIFICAR**).
 
 ## Roadmap exploratório
 
-Sem requisito multi-master claro, RAFT é overkill na maioria dos cenários. Sugestão de roadmap exploratório:
-
-1. **Nível 1 (entender)**: ler documentação oficial, Oracle-Base, blog Mike Dietrich. ~4h.
-2. **Nível 2 (lab pessoal)**: 3 containers Docker com 23ai Free, configurar GSM + 1 RU. Simular failover. ~2 dias.
-3. **Nível 3 (POC)**: workload sintético, medir latência write com diferentes replication_factor. ~1 semana.
-4. **Nível 4 (produção)**: só com treinamento Oracle dedicado e consultoria.
-
-Sem projeto concreto de distribuição geográfica, nível 1-2 é suficiente para informar decisões futuras.
+1. **Entender:** guia oficial + oracle-base.
+2. **Lab:** 3 nós 26ai Free (limite da licença Free) + GSM; criar catálogo com `-repl native`, fazer deploy, `status ru`, derrubar o leader e observar a eleição. Ambiente local → `oracle-lab-ptbr`.
+3. **POC:** carga sintética; medir latência de escrita com rede real entre regiões.
+4. **Produção:** só com treinamento e planejamento de licença (RAC por shard).
 
 ## Documentação
 
-- Globally Distributed Database User's Guide: https://docs.oracle.com/en/database/oracle/oracle-database/26/shard/
-- RAFT Replication chapter: capítulo dedicado dentro do guide acima
-- LiveLabs: "Oracle Sharding" e "RAFT Replication Quickstart"
-- MOS Notes: "RAFT Replication Best Practices" (atualizada por release update)
+- Globally Distributed Database Guide 26ai: https://docs.oracle.com/en/database/oracle/oracle-database/26/shard/
+- Enabling Raft Replication: https://docs.oracle.com/en/database/oracle/oracle-database/26/shard/enabling-raft-replication.html
+- Raft Replication Concepts: https://docs.oracle.com/en/database/oracle/oracle-database/26/shard/raft-replication-concepts.html
+- GDSCTL Reference: https://docs.oracle.com/en/database/oracle/oracle-database/26/gsctl/
+- V$SHARD_REPLICATION_UNIT: https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/V-SHARD_REPLICATION_UNIT.html
+- Licenciamento: https://docs.oracle.com/en/database/oracle/oracle-database/26/dblic/Licensing-Information.html

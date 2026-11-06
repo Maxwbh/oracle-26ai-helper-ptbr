@@ -1,143 +1,169 @@
 # JSON Relational Duality — Reference
 
-Conceitos e padrões para Oracle AI Database 23ai/26ai.
+Conceitos e padrões para Oracle AI Database 23ai/26ai. Revisado em nov/2026 contra o JSON-Relational Duality Developer's Guide 26ai. Itens sem fonte confirmada estão marcados **A VERIFICAR**.
+
+## Índice
+
+- [O que é](#o-que-é)
+- [Sintaxes: SQL e GraphQL](#sintaxes-sql-e-graphql)
+- [Anotações e diretivas](#anotações-e-diretivas)
+- [ETag — optimistic concurrency](#etag--optimistic-concurrency)
+- [Regras de DML](#regras-de-dml)
+- [GraphQL nativo no 26ai](#graphql-nativo-no-26ai)
+- [Acesso via ORDS e MongoDB API](#acesso-via-ords-e-mongodb-api)
+- [Novidades 26ai por Release Update](#novidades-26ai-por-release-update)
+- [Quando usar](#quando-usar)
+- [Tipos relacionados de JSON](#tipos-relacionados-de-json)
+- [Erros comuns](#erros-comuns)
+- [Documentação](#documentação)
 
 ## O que é
 
-JSON Relational Duality é uma capacidade que **expõe dados relacionais como documentos JSON** sem duplicação. Storage = relacional normalizado; Access = JSON ou SQL, escolha do cliente.
+Duality view expõe dados relacionais como documentos JSON, sem duplicar dados. O armazenamento é relacional normalizado; o acesso é JSON ou SQL, à escolha do cliente. Por padrão a view é **somente leitura**: escrita só onde houver anotação.
 
 Não confundir com:
-- **Native JSON storage** (coluna JSON em tabela): JSON é o storage também
-- **JSON Collection Tables**: tabela com 1 coluna JSON (document store puro)
-- **JSON Collection Views**: read-only sobre relacional
-- **Duality Views**: read-write, sincronização bidirecional automática
+- **Coluna JSON** em tabela: o JSON é o próprio armazenamento
+- **JSON Collection Table**: coleção estilo MongoDB (documento puro)
+- **JSON Collection View** (26ai): somente leitura sobre relacional
 
-## Sintaxes
+## Sintaxes: SQL e GraphQL
 
-Duas sintaxes equivalentes:
+### SQL
 
-### SQL (verbosa, familiar)
 ```sql
-CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW dept_dv AS
+-- 26ai (23ai+)
+CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW departamentos_dv AS
 SELECT JSON {
-  '_id'      : d.deptno,
-  'nome'     : d.dname,
-  'employees': [
-    SELECT JSON {
-      'idEmployee' : e.empno,
-      'nome'       : e.ename
-    }
-      FROM emp e WITH INSERT UPDATE DELETE
-     WHERE d.deptno = e.deptno
-  ]
-}
-  FROM dept d WITH INSERT UPDATE DELETE;
+         '_id'          : d.id_departamento,
+         'nome'         : d.nome,
+         'funcionarios' : [
+           SELECT JSON {
+                    'idFuncionario' : f.id_funcionario,
+                    'nome'          : f.nome
+                  }
+             FROM funcionarios f WITH INSERT UPDATE DELETE
+            WHERE f.id_departamento = d.id_departamento
+         ]
+       }
+  FROM departamentos d WITH INSERT UPDATE DELETE;
 ```
 
-### GraphQL (concisa, moderna)
+### GraphQL (na DDL da view)
+
 ```sql
-CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW dept_dv AS
-dept @insert @update @delete {
-  _id       : deptno,
-  nome      : dname,
-  employees : emp @insert @update @delete
-                  @link (to: ["deptno"]) [{
-    idEmployee : empno,
-    nome       : ename
+-- 26ai (23ai+)
+CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW departamentos_dv AS
+departamentos @insert @update @delete {
+  _id          : id_departamento,
+  nome         : nome,
+  funcionarios : funcionarios @insert @update @delete
+                 @link (to : ["ID_DEPARTAMENTO"]) [{
+    idFuncionario : id_funcionario,
+    nome          : nome
   }]
 };
 ```
 
-Ambas geram view idêntica. Use a que preferir; equipes vindas de NoSQL geralmente preferem GraphQL.
+- `@link(to: [...])` aponta a FK na tabela **aninhada** (um-para-muitos); `@link(from: [...])` aponta a FK na tabela **externa** (um-para-um).
+- O `@link` só é obrigatório quando há mais de uma FK entre as duas tabelas ou FK para a própria tabela.
+- Os exemplos da doc usam o nome da coluna em maiúsculas.
 
-## Anotações de DML
+## Anotações e diretivas
 
-| Anotação SQL | GraphQL | Significado |
+| SQL | GraphQL | Efeito |
 |---|---|---|
-| `WITH INSERT` | `@insert` | Permite criar via duality |
-| `WITH UPDATE` | `@update` | Permite alterar via duality |
-| `WITH DELETE` | `@delete` | Permite excluir via duality |
-| `WITH NOINSERT` | `@noinsert` | Bloqueia INSERT |
-| `WITH NOUPDATE` | `@noupdate` | Bloqueia UPDATE |
-| `WITH NODELETE` | `@nodelete` | Bloqueia DELETE |
-| `WITH NOCHECK` | `@nocheck` | Mudanças NÃO afetam ETag (otimização concorrência) |
-| `WITH CHECK` | `@check` | Default — mudanças afetam ETag |
+| `WITH INSERT` / `UPDATE` / `DELETE` | `@insert` / `@update` / `@delete` | Libera a operação na tabela |
+| `WITH NOINSERT` / `NOUPDATE` / `NODELETE` | `@noinsert` / `@noupdate` / `@nodelete` | Bloqueia; vale também por coluna (`'x' : t.col WITH NOUPDATE`) |
+| `WITH NOCHECK` | `@nocheck` | Campo (ou tabela) **fora** do cálculo do ETag |
+| `WITH CHECK` | `@check` | Campo no cálculo do ETag (comportamento padrão) |
+
+Anotação na coluna prevalece sobre a da tabela.
+
+Diretivas GraphQL do 26ai: `@array`, `@cast`, `@[no]check`, `@[no]delete`, `@flex`, `@nest`/`@unnest`, `@generated`, `@hidden`, `@[no]insert`, `@link`, `@object`, `@onnull`, `@[no]update`.
 
 ## ETag — optimistic concurrency
 
-Cada documento tem `_metadata.etag` = hash do conteúdo das colunas que contribuem para ETag (excluindo `@nocheck`).
+Cada documento tem `_metadata.etag`, calculado sobre os campos que não estão marcados com `NOCHECK`. O `_metadata` também traz `asof` (SCN). Ambos são gerenciados pelo banco: no INSERT o `_metadata` é ignorado.
 
 Fluxo:
-1. **GET** documento → recebe ETag `X1`
-2. Aplicação modifica
-3. **PUT** com ETag `X1`
-4. Banco verifica: ainda é `X1`? Se sim, aplica e gera novo ETag `X2`. Se não, **ORA-42699**.
-5. Em mismatch, aplicação re-fetch e retry
+1. **GET** do documento → ETag `X1`
+2. Aplicação altera o documento
+3. **UPDATE** do documento completo com `"_metadata": {"etag": "X1"}`
+4. Se o ETag atual for outro → **ORA-42699** (via REST: HTTP 412)
+5. Em caso de conflito: reler e tentar de novo
 
-Vantagens vs SELECT FOR UPDATE:
-- Funciona em arquiteturas stateless (REST, MongoDB API)
-- Sem lock holding entre requests
-- Escala melhor
+Vantagens sobre `SELECT FOR UPDATE`: funciona em arquiteturas sem estado (REST, MongoDB API) e não segura lock entre requisições.
 
-## Regras críticas de DML
+## Regras de DML
 
-1. **`_id` deve ser PRIMEIRO campo no JSON do UPDATE.** Se `_metadata` aparece antes, erro.
-2. **`_metadata` deve ser segundo.** Padrão: `{"_id": ..., "_metadata": {...}, ...resto...}`
-3. **ETag value é string plana, sem aspas escapadas internas.**
-4. **Campo omitido em UPDATE preserva valor anterior.** Não precisa enviar JSON completo.
-5. **Sub-array omitido em UPDATE com WITH DELETE → rows deletadas.** Cuidado.
+1. Toda duality view tem campo `_id` no nível superior.
+2. **Não há regra de ordem de campos.** A doc diz que objetos JSON têm ordem de campos indefinida. A regra "`_id` primeiro, `_metadata` segundo" da v1 foi removida.
+3. Em **update parcial** (`JSON_TRANSFORM`) o ETag não é enviado, então não há controle otimista.
+4. Filho de um-para-muitos **sem** `DELETE`: as linhas não são apagadas; a FK delas recebe NULL.
+5. Duality view exige PK/FK declaradas.
 
-## Acesso via MongoDB API
+## GraphQL nativo no 26ai
 
-Duality views são automaticamente expostas via MongoDB API (com ORDS):
+Além da DDL, o 26ai tem a função de tabela `GRAPHQL()` para consultar tabelas com sintaxe GraphQL; ela retorna uma coluna `DATA` do tipo JSON. Documentada a partir do RU **23.26.0**, junto com a API de introspecção de schema GraphQL.
 
-```javascript
-// Cliente MongoDB conectando em duality view dept_dv
-const dept = db.collection('DEPT_DV');
-
-// findOne
-const doc = await dept.findOne({_id: 10});
-
-// updateOne com ETag implícito
-await dept.replaceOne({_id: 10, _metadata: doc._metadata}, novoDoc);
+```sql
+-- 26ai 23.26.0+
+SELECT JSON_SERIALIZE(data PRETTY)
+  FROM GRAPHQL('query { departamentos { id: id_departamento nome } }');
 ```
 
-ORDS em 24.1+ tem AutoREST que gera endpoints REST completos a partir de duality views.
+Use `GRAPHQL()` para **leitura ad hoc** em formato JSON. Use a duality view quando precisar de leitura **e** escrita com ETag.
+
+## Acesso via ORDS e MongoDB API
+
+- **ORDS AutoREST** de duality views: ORDS **23.1+** (release notes do ORDS 23.1). Detalhes de endpoint → `oracle-ords-ptbr`.
+- **Oracle Database API for MongoDB** sobre duality views: só no 26ai ou superior; fora do Autonomous roda dentro do ORDS. Versão mínima do ORDS: **A VERIFICAR**.
+- Com **Deep Data Security** (23.26.2+) a autorização do usuário final vale também para documentos de duality views — ver `ecossistema-ia-26ai.md`.
+
+## Novidades 26ai por Release Update
+
+| RU | Novidade |
+|---|---|
+| 23.26.0 | Melhorias na sintaxe GraphQL da DDL; `GRAPHQL()`; introspecção de schema |
+| 23.26.2 | Inline Write Augmentation; Validation Directives |
+| 23.26.3 | Array Limits; Deletable Shared Tables; User-Defined Identifying Keys |
+| 23.26.4 | Inferência incremental de schema no JSON-to-Duality Migrator |
+| 26ai (RU não identificado) | Campos `@hidden` e `@generated`, flex columns, JSON Collection Views, JSON-to-Duality Migrator, Notification Directives |
 
 ## Quando usar
 
-✓ Aplicação tem clientes mistos (alguns via SQL, outros via MongoDB driver)
-✓ Migração de MongoDB para Oracle preservando interface document
-✓ Simplificar API REST sem sacrificar normalização
-✓ Acesso "objeto-relacional" sem ORM complexo
+✓ Clientes mistos (SQL e documento/MongoDB)
+✓ Migração de MongoDB para Oracle preservando a interface de documento
+✓ API REST simples sem abrir mão da normalização
 
-✗ Aplicação 100% SQL com schema estável (overhead desnecessário)
-✗ Hierarquias muito profundas (3+ níveis)
-✗ Sub-arrays gigantes (1000+ items por documento)
-✗ Workload com taxa de UPDATE > 1000/s na mesma row (ETag collisions)
+✗ Aplicação 100% SQL com schema estável (complexidade sem ganho)
+✗ Documentos muito profundos ou com arrays enormes — meça antes; considere **Array Limits** (23.26.3+)
+✗ Muitos UPDATEs concorrentes no mesmo documento (conflito de ETag) — use `NOCHECK` nos campos não críticos
 
 ## Tipos relacionados de JSON
 
-Em 23ai/26ai há 3 tipos de JSON Collections:
-
-| Tipo | Read | Write | Storage | Use case |
-|---|---|---|---|---|
-| **JSON Relational Duality View** | ✓ | ✓ (com ETag) | Relacional normalizado | Híbrido |
-| **JSON Collection Table** | ✓ | ✓ (raw JSON) | JSON nativo | Document store puro |
-| **JSON Collection View** | ✓ | ✗ | Relacional | Read-only API |
-
-Documentação:
-
-- JSON Developer's Guide: https://docs.oracle.com/en/database/oracle/oracle-database/26/adjsn/
-- JSON-Relational Duality Developer's Guide: https://docs.oracle.com/en/database/oracle/oracle-database/26/jsnvu/
-- Oracle Database API for MongoDB: https://docs.oracle.com/en/database/oracle/mongodb-api/
+| Tipo | Leitura | Escrita | Armazenamento |
+|---|---|---|---|
+| JSON Relational Duality View | ✓ | ✓ (com ETag) | Relacional normalizado |
+| JSON Collection Table | ✓ | ✓ | JSON nativo |
+| JSON Collection View (26ai) | ✓ | ✗ | Relacional |
 
 ## Erros comuns
 
-| Erro | Causa |
+| Erro | Significado (Error Help 26ai) |
 |---|---|
-| `ORA-42692` | Tentou DML mas anotação é NOINSERT/NOUPDATE/NODELETE |
-| `ORA-42699` | ETag mismatch — concorrência |
-| `ORA-42624` | Field `_id` ausente ou inválido |
-| `ORA-42693` | DELETE de sub-row em sub-array NODELETE |
-| `ORA-40769` | View já existe; use CREATE OR REPLACE |
+| `ORA-42699` | ETag do documento no banco diferente do ETag enviado |
+| `ORA-40940` | Campo não pode ser atualizado: falta anotação UPDATE ou há NOUPDATE |
+| `ORA-42692` | Erro de DML numa tabela-base da duality view (veja o erro aninhado) |
+| `ORA-42693` | Na criação: tabela dependente não pode ter anotação DELETE |
+| `ORA-42605` | A mesma linha da tabela foi modificada mais de uma vez |
+| `ORA-42624` | Coluna inválida no ORDER BY de duality view |
+
+## Documentação
+
+- JSON-Relational Duality Developer's Guide 26ai: https://docs.oracle.com/en/database/oracle/oracle-database/26/jsnvu/
+- Diretivas GraphQL: https://docs.oracle.com/en/database/oracle/oracle-database/26/jsnvu/oracle-supported-graphql-directives-json-relational-duality-views.html
+- Função GRAPHQL: https://docs.oracle.com/en/database/oracle/oracle-database/26/gphql/graphql-table-function.html
+- MongoDB API e duality: https://docs.oracle.com/en/database/oracle/mongodb-api/mgapi/duality.html
+- Error Help: https://docs.oracle.com/en/error-help/db/ora-42699/
+- oracle-base: https://oracle-base.com/articles/23/json-relational-duality-views-23 e https://oracle-base.com/articles/23/graphql-23

@@ -6,6 +6,13 @@
 --
 -- Detalhes operacionais variam por ambiente — este template é referência,
 -- não substituto de planejamento DBA dedicado.
+--
+-- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Edição Free: Parcial — serve como DESTINO de laboratório (26ai Free,
+--   2 cores / 2 GB RAM / 12 GB de dados); upgrade de produção é EE.
+-- Operação detalhada do upgrade (RMAN, Data Guard, PDB): oracle-dba-ptbr
+-- Checklist de código e sintaxe nova: oracle-26ai-ptbr
+-- Suíte: https://github.com/Maxwbh/oracle-skills-ptbr
 --==============================================================================
 
 
@@ -18,18 +25,20 @@ ORIGEM TÍPICA:
   - Oracle Database 19c Enterprise Edition
   - Provavelmente Linux x86-64 ou AIX/Windows
   - Pode ser non-CDB (legacy) ou já CDB
-  - APEX 24.2 (atual) ou anterior
+  - APEX 24.2, 26.1 ou anterior
 
 DESTINO:
-  - Oracle AI Database 26ai (versão técnica 23.26.x)
-  - Enterprise Edition (SE2 ainda sem data em abril/2026)
-  - Linux x86-64 GA desde janeiro/2026; outras platafs em 2026
-  - APEX 24.2 (continua mesmo em 26ai; APEX 26.1 ainda não saiu)
+  - Oracle AI Database 26ai (versão técnica 23.26.x; RU atual 23.26.4, out/2026)
+  - Enterprise Edition on-prem: Linux x86-64, GA em 27/01/2026 (23.26.1)
+  - Outras plataformas: IBM AIX, zLinux e Windows previstos para 2027;
+    SPARC Solaris e Linux ARM NÃO planejados (Mike Dietrich, 01/10/2026)
+  - Standard Edition 2: A VERIFICAR (fontes de terceiros divergem)
+  - APEX: 26.1 (GA mai/2026) e 26.2 (GA 06/10/2026) já existem; a escolha da
+    versão do APEX é assunto da oracle-apex-ptbr
 
 MUDANÇAS ARQUITETURAIS OBRIGATÓRIAS:
-  ✗ Non-CDB DESCONTINUADO em 26ai
-  ✓ Consolidação em CDB/PDB obrigatória durante migração
-  ✓ MAX_PDB_PER_CDB padrão = 252 (era diferente em 19c)
+  ✗ Non-CDB desuportado (desde 21c, segundo oracle-base) — não existe 26ai non-CDB
+  ✓ Todo non-CDB 19c vira PDB dentro de um CDB 26ai
 */
 
 
@@ -39,10 +48,11 @@ MUDANÇAS ARQUITETURAIS OBRIGATÓRIAS:
 
 /*
 DIRETO 19c → 26ai (RECOMENDADO):
-  - Suportado oficialmente
-  - Sem passar por 21c ou 23ai
+  - Suportado: upgrade direto a partir de 19c e 21c (todas as releases)
+    (Upgrade Guide 26ai — "Oracle Database Releases That Support Direct Upgrade")
+  - 23ai → 26ai é aplicação de RU (patch), não upgrade completo (oracle-base)
   - AutoUpgrade automatiza grande parte
-  - Documentação: MOS Note 884522.1
+  - Documentação: Upgrade Guide 26ai (link na seção 9)
 
 NÃO SUPORTADO:
   - 11g → 26ai (precisa pular para 19c primeiro)
@@ -59,7 +69,8 @@ AutoUpgrade é Java-based, vem incluso na instalação 26ai.
 
 LOCALIZAÇÃO:
   $ORACLE_HOME/rdbms/admin/autoupgrade.jar
-  Versão atual (abril/2026): 25.6+
+  Use SEMPRE a versão mais recente do MOS 2485457.1 (substitua a do ORACLE_HOME).
+  Versão mais recente em nov/2026: 26.6 (build 26.6.260925, 25/09/2026)
 
 CAPACIDADES:
   ✓ Pre-upgrade analysis (encontra problemas antes)
@@ -68,7 +79,7 @@ CAPACIDADES:
   ✓ Conversão non-CDB → CDB durante o processo
   ✓ Multi-target (múltiplos databases em uma execução)
   ✓ Resumível em caso de falha
-  ✓ Rollback (restore do backup pré-upgrade)
+  ✓ Fallback via restore point garantido (configurável; ver AutoUpgrade Guide)
 
 EXEMPLO DE CONFIGURAÇÃO (config file YAML/JSON):
 
@@ -81,6 +92,8 @@ EXEMPLO DE CONFIGURAÇÃO (config file YAML/JSON):
   upg1.upgrade_node=hostname.example.local
   upg1.run_utlrp=yes
   upg1.timezone_upg=yes
+  -- A VERIFICAR: valor aceito por target_version para 26ai (consultar o
+  --              AutoUpgrade User's Guide antes de usar)
   upg1.target_version=26
 
 
@@ -123,7 +136,8 @@ IMPLICAÇÕES:
   - Aplicações com connection pool (Java, .NET): reconfigurar
 
 CDB MULTITENANT:
-  - 26ai permite até 252 PDBs por CDB (default)
+  - Limite de PDBs por CDB depende de edição/licença: A VERIFICAR no Licensing
+    Information User Manual 26ai antes de planejar consolidação
   - Em ambientes corporativos: provavelmente 1 PDB por banco existente é suficiente
   - Para ambientes dev/homo/prod separados: múltiplos PDBs no mesmo CDB
 */
@@ -139,23 +153,18 @@ DESUPPORTED EM 26ai (precisam ser removidos antes de upgrade):
   - AutoUpgrade detecta e sinaliza
   - Lista completa: docs.oracle.com → "Behavior Changes 26ai"
 
-NOVOS PARAMS RELEVANTES:
+NOVOS PARAMS RELEVANTES PARA AS FEATURES DESTA SKILL:
 
-  vector_memory_size
-    Aloca Vector Memory Pool (essencial para HNSW indexes)
-    Default: 0 (sem alocação — HNSW falha)
-    Recomendação: 256M para exploração; produção depende de workload
+  vector_memory_size                                        -- 26ai
+    Vector Pool (onde ficam os índices HNSW; acelera criação de IVF)
+    Default: 0. Range: 0 a 70% da SGA.
+    Dinâmico: ALTER SYSTEM ... SCOPE=BOTH; modificável no PDB (no CDB = tamanho
+    do pool; no PDB = cota). Valor 1 com sga_target > 0 = auto-sizing (23.8+).
+    Fonte: Reference 26ai, VECTOR_MEMORY_SIZE
 
-  enable_ai_vector_search
-    Habilita features Vector Search
-    Default: TRUE em 26ai
-
-  json_relational_duality
-    Habilita JSON Duality Views
-    Default: TRUE em 26ai
-
-  result_cache_remote_expiration
-    Comportamento alterado em RAC + RAFT
+  Não há parâmetro para "ligar" Vector Search ou Duality Views: as features
+  vêm habilitadas no 26ai. (Os parâmetros enable_ai_vector_search e
+  json_relational_duality citados na v1 foram removidos — não existem na doc.)
 */
 
 
@@ -164,13 +173,13 @@ NOVOS PARAMS RELEVANTES:
 --==============================================================================
 
 /*
-APEX em 26ai = continua sendo APEX 24.2 (não há APEX 26 ainda).
+APEX existente no 19c sobe junto com o banco; a versão do APEX não muda só
+porque o banco virou 26ai. Atualizar para APEX 26.1/26.2 é decisão separada
+(APEX 26.2 exige banco 19c RU 19.18+ ou 26ai — release notes 26.2).
+Detalhes de versão/compatibilidade: oracle-apex-ptbr e oracle-26ai-ptbr.
 
-UPGRADE PATH:
-  1. AutoUpgrade do BD para 26ai inclui APEX automaticamente
-  2. Schema APEX_240200 (24.2) permanece o mesmo
-  3. Apps existentes continuam funcionando sem modificação
-  4. APEX 26.1 será release update separado quando GA (2026 fim/2027 início)
+  -- A VERIFICAR: se o AutoUpgrade trata o componente APEX automaticamente
+  --              (não encontrado no Upgrade Guide 26ai lido em nov/2026)
 
 VALIDAÇÃO PÓS-UPGRADE:
   -- Schema APEX deve estar VALID
@@ -243,7 +252,8 @@ FASE 6: PÓS-UPGRADE (semanas)
 
 /*
 RISCO: AutoUpgrade falha no meio
-  Mitigação: AutoUpgrade tem rollback automático, mas TESTAR antes em homo
+  Mitigação: plano de fallback testado em homo (restore point garantido ou
+             backup com restore validado) antes do DEPLOY em produção
 
 RISCO: Plans de execução piores em 26ai
   Mitigação: SQL Plan Management — capturar baseline em 19c, aplicar em 26ai
@@ -278,13 +288,15 @@ DOCUMENTAÇÃO OFICIAL:
   - AutoUpgrade User's Guide:
     https://docs.oracle.com/en/database/oracle/oracle-database/26/upgrd/using-autoupgrade-oracle-database-upgrades.html
 
-MOS NOTES (My Oracle Support, login required):
-  - 884522.1: NLS Considerations During Upgrade
-  - 1645862.1: AutoUpgrade Tool — Best Practices
-  - 2485457.1: Latest AutoUpgrade Build
-  - 742060.1: Release Schedule of Current Database Releases
+  - Releases com upgrade direto:
+    https://docs.oracle.com/en/database/oracle/oracle-database/26/upgrd/oracle-database-releases-that-support-direct-upgrade.html
 
-LIVELABS (hands-on grátis):
+MOS NOTES (My Oracle Support, login required — títulos A VERIFICAR no MOS):
+  - 2485457.1: Latest AutoUpgrade Build (citado por oracle-base)
+  - 742060.1 / PNEWS1360: Release Schedule of Current Database Releases
+  - 884522.1 e 1645862.1: citados na v1; conferir título/vigência no MOS
+
+LIVELABS (hands-on grátis — títulos A VERIFICAR no catálogo LiveLabs):
   - "Upgrade to Oracle Database 26ai with AutoUpgrade"
   - "Migrate Non-CDB to PDB"
 
@@ -295,7 +307,7 @@ BLOG POSTS RECOMENDADOS:
 EM AMBIENTES CORPORATIVOS:
   - Em ambientes sem data fixa para migração:
   - Exploração técnica em ambiente lab é início recomendado
-  - 19c suporte premier até 30/04/2024 (já encerrado)
-  - 19c Extended Support até 30/04/2027
+  - 19c Premier Support até 31/12/2029; Extended Support de 01/01/2030 a
+    31/12/2032 (Mike Dietrich, 20/11/2024 — confirmar no MOS 742060.1)
   - Há tempo para planejar com cuidado, mas não infinito
 */
