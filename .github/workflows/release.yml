@@ -1,0 +1,73 @@
+name: Release
+
+# Ao enviar uma tag de versão (ex.: 1.1.1 ou v1.1.1), valida o repositório,
+# monta o pacote .skill e publica a Release com o pacote anexado.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publicar Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags anteriores, para montar as notas
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar repositório
+        run: python3 .github/scripts/validar_repositorio.py .
+
+      - name: Conferir tag × metadata.version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          versao=$(grep -m1 -E '^\s+version:' SKILL.md | awk '{print $2}')
+          echo "tag=$tag metadata.version=$versao"
+          test "$tag" = "$versao"
+
+      - name: Montar pacote .skill
+        run: |
+          set -euo pipefail
+          mkdir -p build/oracle-26ai-helper-ptbr
+          cp -r SKILL.md references assets CHANGELOG.md LICENSE NOTICE build/oracle-26ai-helper-ptbr/
+          (cd build && zip -qr oracle-26ai-helper-ptbr.skill oracle-26ai-helper-ptbr)
+          topo=$(unzip -Z1 build/oracle-26ai-helper-ptbr.skill | cut -d/ -f1 | sort -u | wc -l)
+          skills=$(unzip -Z1 build/oracle-26ai-helper-ptbr.skill | grep -c '/SKILL.md$')
+          test "$topo" -eq 1 && test "$skills" -eq 1
+          unzip -l build/oracle-26ai-helper-ptbr.skill | tail -1
+
+      - name: Notas da Release (CHANGELOG desde a tag anterior)
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          anterior=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          echo "tag=$tag anterior=${anterior:-nenhuma}"
+          # Do cabeçalho da versão atual até o da tag anterior (exclusive);
+          # sem tag anterior no CHANGELOG, só a seção da versão atual.
+          awk -v v="$tag" -v ant="$anterior" '
+            $0 ~ "^## \\[" v "\\]" {dentro=1; print; next}
+            dentro && ant != "" && index($0, "## [" ant "]") == 1 {exit}
+            dentro && ant == "" && /^## \[/ {exit}
+            dentro {print}
+          ' CHANGELOG.md > notas.md
+          test -s notas.md
+          printf '\n---\nInstalação: Claude.ai → Settings → Capabilities → Skills → upload de `oracle-26ai-helper-ptbr.skill`.\n' >> notas.md
+
+      - name: Publicar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/oracle-26ai-helper-ptbr.skill \
+            --title "oracle-26ai-helper-ptbr ${GITHUB_REF_NAME}" \
+            --notes-file notas.md \
+            --verify-tag
