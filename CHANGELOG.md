@@ -5,6 +5,31 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere a [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [1.1.1] — 2026-11-06
+
+Teste de integração dos templates no **Oracle AI Database 26ai Free 23.26.3** (imagem oficial `container-registry.oracle.com/database/free:latest`, SQL*Plus).
+
+### Adicionado
+- Linha `-- Testado:` no cabeçalho dos 7 templates executados, com o resultado
+- `.github/scripts/teste_integracao_local.sh`: sobe o 26ai Free em container, roda os templates de Duality e (com o arquivo ONNX) os de Vector, e resume os erros
+- Validador (`validar_repositorio.py`) passa a barrar as armadilhas de SQL*Plus/SQLcl: `;` seguido de comentário, linha em branco dentro de comando SQL e linha iniciando com `@`
+- Tabela de dados de origem `laudos_origem` em `ai_vector_search_basics.sql` (o INSERT em lote referenciava tabela inexistente)
+- `ambiente-teste/` (fora do pacote): Docker Compose com 26ai Free + ORDS 26.3.1 + APEX 26.2, Vector Pool ligado no startup, pós-instalação (senha do ADMIN do INTERNAL), snapshot dourado (`congelar.sh`/`restaurar.sh`) e PDB descartável clonado de um PDB dourado (`pdb.sh`, `testar.sh`). Medido: restauração em 139 s, stop/start em 55 s e suíte completa num PDB limpo em 30 s, contra ~21 min da primeira instalação
+
+### Alterado
+- Tabela "funciona no Free?" com resultados medidos (Vector e Duality funcionam no Free 23.26.3; quantização PRODUCT não, por ser 23.26.4+)
+- `ai_vector_index_strategies.sql` executável em sequência: `DROP INDEX IF EXISTS` entre as alternativas (uma coluna aceita um índice vetorial — ORA-01408); IVF LOCAL comentado (exige tabela particionada); exemplo de `REBUILD_INDEX` sobre o HNSW quantizado
+- Notas de privilégio: `DBMS_VECTOR_ADMIN` só para `PDB_DBA`; consultas V$ exigem `SELECT_CATALOG_ROLE`
+
+### Corrigido
+- **`;` seguido de comentário** fazia o SQL*Plus descartar o comando sem erro: o `GRANT CREATE MINING MODEL` não era executado e o `LOAD_ONNX_MODEL` falhava com ORA-01031 (também em `LOCAL;`, `FETCH APPROX …;` e numa duality view)
+- **Linha em branco dentro de `CREATE … DUALITY VIEW`** encerrava o comando (view não criada; erros em cascata no template de ETag)
+- **Linha iniciando com `@link`** na DDL GraphQL era executada como script pelo SQL*Plus (SP2-0310)
+- **`vector_memory_size`:** a 1.1.0 dizia "dinâmico, não exige restart". Medido: no CDB com pool 0 no startup, o aumento exige `SCOPE=SPFILE` + restart (ORA-51950); com pool alocado, cresce sem restart e não reduz abaixo do inicial (ORA-51953); no PDB a cota é dinâmica e limitada ao CDB (ORA-51955)
+- `CREATE TABLESPACE … DATAFILE SIZE` sem caminho exige OMF (ORA-02236 no container Free): o template passa a informar o caminho e explica a alternativa com OMF
+- Exemplos de UPDATE/DELETE em duality view usavam texto `<etag lido>` (geravam ORA-42699): agora leem o ETag real numa variável de ligação
+- Exemplo de DELETE com ETag apontava para documento já excluído
+
 ## [1.1.0] — 2026-11-06
 
 Revisão completa contra a documentação Oracle AI Database 26ai (RU 23.26.4, out/2026), oracle-base.com e mikedietrichde.com. Itens sem fonte confirmada ficaram marcados "A VERIFICAR".
@@ -38,7 +63,7 @@ Revisão completa contra a documentação Oracle AI Database 26ai (RU 23.26.4, o
 - Comandos GDSCTL inexistentes (`add ru`, `failover ru`, `config ru`, `add/remove replica`) e a view `gv$sharding_units`
 
 ### Corrigido
-- `vector_memory_size` é dinâmico (`SCOPE=BOTH`, modificável no PDB) — não exige restart
+- `vector_memory_size`: no CDB com pool 0 o aumento exige `SCOPE=SPFILE` + restart (ORA-51950); com pool alocado, cresce sem restart e não reduz abaixo do inicial (ORA-51953); no PDB a cota é dinâmica e limitada ao CDB (ORA-51955) — medido no 26ai Free 23.26.3
 - Quantização HNSW: `QUANTIZATION SCALAR COMPRESSION RATIO` (23.26.1+) e `PRODUCT` (23.26.4+) no lugar de `vector_compression` inventado
 - IVF: parâmetro `NEIGHBOR PARTITIONS`; `ALTER INDEX … REBUILD ONLINE` só para IVF, HNSW via `DBMS_VECTOR.REBUILD_INDEX`; `CREATE VECTOR INDEX … ONLINE` desde 23.26.1
 - Hybrid vector index (`MODEL … VECTOR_IDXTYPE …`) e `DBMS_HYBRID_VECTOR.SEARCH` (argumento JSON único)

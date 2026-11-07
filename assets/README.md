@@ -62,19 +62,21 @@ Nenhum template foi executado em banco no CI: a validação automática (`.githu
 
 O **Oracle AI Database 26ai Free** tem limite de 2 cores, 2 GB de RAM e 12 GB de dados de usuário. Fonte: Free Installation Guide 26ai, Licensing Restrictions.
 
-| Template | Free? | Observação |
+**Teste de integração (nov/2026):** imagem `container-registry.oracle.com/database/free:latest`, que roda o **RU 23.26.3** (o rótulo da imagem diz 23.26.0; o `v$instance` mostra 23.26.3.0.0), com SQL*Plus. "Funciona" abaixo é resultado medido. A licença do Free para Vector Search e Duality continua sem linha explícita no Licensing Information User Manual.
+
+| Template | Free? | Resultado / observação |
 |---|---|---|
-| `ai_vector_search_basics.sql` | Parcial | VECTOR, ONNX e busca exata rodam. O modelo ONNX e o Vector Pool precisam caber nos 2 GB. A doc de licença não lista Vector Search no Free (**A VERIFICAR**) |
-| `ai_vector_index_strategies.sql` | Parcial | HNSW limitado pelo pool dentro dos 2 GB; recursos de RAC não se aplicam; blocos 23.26.x dependem do RU da imagem Free |
-| `ai_vector_embedding_pipeline.sql` | Parcial | O caminho com ONNX no banco roda; provedor externo exige rede, ACL e credencial |
-| `ai_vector_rag_pattern.sql` | Parcial | A recuperação roda; a geração exige LLM externo (ou Ollama local), rede e credencial |
-| `json_duality_view_basics.sql` | A verificar | A doc de licença não tem linha explícita de duality views para o Free |
-| `json_duality_dml.sql` | A verificar | Idem |
-| `json_duality_etag_concurrency.sql` | A verificar | Idem |
-| `raft_setup_overview.sql` | Sim | Licença 26ai: Raft no Free com até 3 nós, cada um dentro dos limites do Free |
-| `raft_replication_units.sql` | Sim | Idem (3 nós Free) |
-| `raft_failover_recovery.sql` | Sim | Idem; dá para simular a queda do leader em laboratório |
-| `migration_19c_to_26ai.sql` | Parcial | O Free serve como destino de laboratório; o upgrade de produção é EE |
+| `ai_vector_search_basics.sql` | **Sim (testado)** | Vector Pool, provisionamento, modelo ONNX oficial (`all_MiniLM_L12_v2`), embeddings e busca exata sem erros. Ligar o pool no CDB exige restart (ver seção 1 do template) |
+| `ai_vector_index_strategies.sql` | **Sim (testado)** | HNSW, IVF, ONLINE, quantização SCALAR, `REBUILD_INDEX`, hybrid index e `DBMS_HYBRID_VECTOR.SEARCH` OK. **PRODUCT falha** (23.26.4+; a imagem é 23.26.3). `DBMS_VECTOR_ADMIN` e V$ exigem DBA/`SELECT_CATALOG_ROLE` |
+| `ai_vector_embedding_pipeline.sql` | **Sim (testado)** | Chunking, embeddings, package e contrato transacional OK. Provedor externo não testado (sem credencial) |
+| `ai_vector_rag_pattern.sql` | **Parcial (testado)** | Recuperação e auditoria (hash, situação, transação autônoma) OK. Geração exige LLM externo com ACL e credencial — não testada |
+| `json_duality_view_basics.sql` | **Sim (testado)** | Sem erros (SQL e GraphQL, `GRAPHQL()`) |
+| `json_duality_dml.sql` | **Sim (testado)** | Sem erros; ETag divergente gera ORA-42699, confirmado |
+| `json_duality_etag_concurrency.sql` | **Sim (testado)** | Sem erros; allowlist barra par não autorizado (ORA-20105). V$ exige `SELECT_CATALOG_ROLE` |
+| `raft_setup_overview.sql` | Sim (licença) | Licença 26ai: Raft no Free com até 3 nós. Não testado (exige GSM e 3 bancos) |
+| `raft_replication_units.sql` | Sim (licença) | Idem |
+| `raft_failover_recovery.sql` | Sim (licença) | Idem |
+| `migration_19c_to_26ai.sql` | Parcial | Free serve como destino de laboratório; não testado (exige banco 19c de origem) |
 
 Montar o ambiente Free local (VM, container, rede): `oracle-lab-ptbr`.
 

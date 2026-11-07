@@ -34,6 +34,61 @@ PROIBIDOS_TEXTO = [
 
 falhas = []
 
+# Armadilhas do SQL*Plus/SQLcl encontradas no teste de integração (26ai Free
+# 23.26.3): todas fazem o comando ser descartado ou mal interpretado, às vezes
+# SEM mensagem de erro.
+INICIO_PLSQL = re.compile(
+    r"^\s*(CREATE\s+(OR\s+REPLACE\s+)?(EDITIONABLE\s+|NONEDITIONABLE\s+)?"
+    r"(PACKAGE|PROCEDURE|FUNCTION|TRIGGER|TYPE)\b|DECLARE\b|BEGIN\b)", re.I)
+COMANDO_CLIENTE = re.compile(
+    r"^(SET|SHOW|ACCEPT|UNDEFINE|DEFINE|VARIABLE|VAR|EXEC|EXECUTE|PROMPT|"
+    r"SPOOL|WHENEVER|COLUMN|COL|SHUTDOWN|STARTUP)\b", re.I)
+
+
+def armadilhas_sqlplus(texto):
+    """Linha em branco dentro de comando SQL, linha iniciando com @ e ';'
+    seguido de comentário na mesma linha (o SQL*Plus não encerra o comando)."""
+    achados, em_bloco, inicio, plsql = [], False, None, False
+    for n, bruta in enumerate(texto.splitlines(), 1):
+        s = bruta.strip()
+        if em_bloco:
+            em_bloco = "*/" not in s
+            continue
+        if inicio is None:
+            if not s or s.startswith("--") or s == "/":
+                continue
+            if s.startswith("/*"):
+                em_bloco = "*/" not in s
+                continue
+            if s.startswith("@"):
+                achados.append((n, "linha começa com @ (executada como script)"))
+            if COMANDO_CLIENTE.match(s):
+                continue
+            inicio, plsql = n, bool(INICIO_PLSQL.match(s))
+            if not plsql and re.search(r";\s*--", s):
+                achados.append((n, "';' seguido de comentário não encerra o comando"))
+                inicio = None
+            elif not plsql and re.search(r";\s*$", s):
+                inicio = None
+            continue
+        if plsql:
+            if s == "/":
+                inicio = None
+            continue
+        if not s:
+            achados.append((n, f"linha em branco encerra o comando iniciado na linha {inicio}"))
+            inicio = None
+            continue
+        if s.startswith("@"):
+            achados.append((n, "linha começa com @ dentro do comando"))
+        codigo = s.split("--", 1)[0].rstrip()
+        if codigo.endswith(";") and re.search(r";\s*--", s):
+            achados.append((n, "';' seguido de comentário não encerra o comando"))
+            inicio = None
+        elif codigo.endswith(";"):
+            inicio = None
+    return achados
+
 
 def falha(msg):
     falhas.append(msg)
@@ -132,6 +187,8 @@ for sql in sorted((RAIZ / "assets").glob("*.sql")):
     for padrao, motivo in PROIBIDOS_SQL:
         if re.search(padrao, codigo, re.I):
             falha(f"{sql.name}: {motivo}")
+    for linha, motivo in armadilhas_sqlplus(texto):
+        falha(f"{sql.name}:{linha}: SQL*Plus — {motivo}")
     # Naming Trivadis: cursor explícito não usa prefixo co_ (é de constante)
     if re.search(r"\bCURSOR\s+co_", codigo, re.I):
         falha(f"{sql.name}: cursor com prefixo co_ (use c_)")

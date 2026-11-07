@@ -160,8 +160,11 @@ NOVOS PARAMS RELEVANTES PARA AS FEATURES DESTA SKILL:
   vector_memory_size                                        -- 26ai
     Vector Pool (onde ficam os índices HNSW; acelera criação de IVF)
     Default: 0. Range: 0 a 70% da SGA.
-    Dinâmico: ALTER SYSTEM ... SCOPE=BOTH; modificável no PDB (no CDB = tamanho
-    do pool; no PDB = cota). Valor 1 com sga_target > 0 = auto-sizing (23.8+).
+    No CDB = tamanho do pool; no PDB = cota. Medido no 26ai Free 23.26.3:
+    CDB com pool 0 no startup só aumenta com SCOPE=SPFILE + restart
+    (ORA-51950) → defina já na janela do upgrade; com pool alocado, cresce
+    sem restart e não reduz abaixo do inicial (ORA-51953); PDB dinâmico,
+    limitado ao CDB (ORA-51955). Valor 1 com sga_target > 0 = auto-sizing (23.8+).
     Fonte: Reference 26ai, VECTOR_MEMORY_SIZE
 
   Não há parâmetro para "ligar" Vector Search ou Duality Views: as features

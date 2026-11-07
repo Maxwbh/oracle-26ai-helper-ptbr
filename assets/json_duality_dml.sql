@@ -6,6 +6,7 @@
 --        para as tabelas-base.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — sem erros
 -- Tipo: Executável — depende das tabelas/views de json_duality_view_basics.sql
 -- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: A verificar — o Licensing Guide 26ai não traz linha explícita
@@ -70,11 +71,21 @@ SELECT JSON_SERIALIZE(d.data PRETTY)
   FROM departamentos_dv d
  WHERE d.data."_id" = 1;
 
+-- Lê o ETAG atual do documento (SQL*Plus/SQLcl: variável de ligação)
+VARIABLE etag_lido VARCHAR2(64)
+BEGIN
+  SELECT JSON_VALUE(d.data, '$._metadata.etag')
+    INTO :etag_lido
+    FROM departamentos_dv d
+   WHERE d.data."_id" = 1;
+END;
+/
+
 -- 2. Gravar o documento completo com o ETAG lido
 UPDATE departamentos_dv d
    SET d.data = '{
      "_id"        : 1,
-     "_metadata"  : {"etag": "<etag lido no passo 1>"},
+     "_metadata"  : {"etag": "' || :etag_lido || '"},
      "nome"       : "Necropsia Especializada",
      "localizacao": "Bloco A - Térreo",
      "funcionarios": [
@@ -118,10 +129,19 @@ UPDATE departamentos_dv d
 
 -- Incluir funcionário: documento completo, novo elemento sem idFuncionario
 -- (a identity gera a chave). Comentários não são permitidos dentro do JSON.
+-- Lê o ETAG atual do documento (SQL*Plus/SQLcl: variável de ligação)
+BEGIN
+  SELECT JSON_VALUE(d.data, '$._metadata.etag')
+    INTO :etag_lido
+    FROM departamentos_dv d
+   WHERE d.data."_id" = 1;
+END;
+/
+
 UPDATE departamentos_dv d
    SET d.data = '{
      "_id"      : 1,
-     "_metadata": {"etag": "<etag lido>"},
+     "_metadata": {"etag": "' || :etag_lido || '"},
      "nome"       : "Necropsia Especializada",
      "localizacao": "Bloco A - Térreo",
      "funcionarios": [
@@ -133,10 +153,19 @@ UPDATE departamentos_dv d
  WHERE d.data."_id" = 1;
 
 -- Remover funcionário: enviar o array sem o elemento
+-- Lê o ETAG atual do documento (SQL*Plus/SQLcl: variável de ligação)
+BEGIN
+  SELECT JSON_VALUE(d.data, '$._metadata.etag')
+    INTO :etag_lido
+    FROM departamentos_dv d
+   WHERE d.data."_id" = 1;
+END;
+/
+
 UPDATE departamentos_dv d
    SET d.data = '{
      "_id"      : 1,
-     "_metadata": {"etag": "<etag lido>"},
+     "_metadata": {"etag": "' || :etag_lido || '"},
      "nome"       : "Necropsia Especializada",
      "localizacao": "Bloco A - Térreo",
      "funcionarios": [
@@ -178,8 +207,17 @@ DELETE FROM departamentos_dv d WHERE d.data."_id" = 5;
 -- Padrão de aplicação para não excluir documento alterado por outro usuário:
 -- filtrar pelo etag lido (0 linhas afetadas = documento mudou → reler).
 -- Não é o mecanismo nativo de ETAG; é um predicado comum sobre o documento.
+-- Lê o ETAG atual do documento (SQL*Plus/SQLcl: variável de ligação)
+BEGIN
+  SELECT JSON_VALUE(d.data, '$._metadata.etag')
+    INTO :etag_lido
+    FROM departamentos_dv d
+   WHERE d.data."_id" = 4;
+END;
+/
+
 DELETE FROM departamentos_dv d
- WHERE d.data."_id" = 5
+ WHERE d.data."_id" = 4
    AND JSON_VALUE(d.data, '$._metadata.etag') = :etag_lido;
 
 

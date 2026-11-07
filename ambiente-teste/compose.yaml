@@ -1,0 +1,53 @@
+# Ambiente de teste: Oracle AI Database 26ai Free + ORDS + APEX
+# Uso: ver ambiente-teste/README.md (./preparar.sh && docker compose up -d)
+name: ora26ai-teste
+
+services:
+  db:
+    image: container-registry.oracle.com/database/free:${DB_TAG:-latest}
+    container_name: ora26ai-db
+    environment:
+      ORACLE_PWD: ${ORACLE_PWD:?defina em .env (./preparar.sh gera)}
+    ports:
+      - "127.0.0.1:${DB_PORTA:-1521}:1521"
+    volumes:
+      - oradata:/opt/oracle/oradata
+      # Roda a CADA subida (a imagem já traz o banco pré-criado; "setup" não
+      # roda). Liga o Vector Pool na primeira vez (exige restart no CDB).
+      - ./db-startup:/opt/oracle/scripts/startup:ro
+      # Modelos ONNX (opcional) — lidos pelo DIRECTORY dir_modelos
+      - ./modelos:/home/oracle/embedding_models:ro
+    healthcheck:
+      # Mesmo teste da imagem, com intervalo menor (a imagem usa 60 s)
+      test: ["CMD-SHELL", "\"$$SCRIPT_BASE_DIR/$$CHECK_DB_FILE\" >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  ords:
+    image: container-registry.oracle.com/database/ords:${ORDS_TAG:-26.3.1}
+    container_name: ora26ai-ords
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DBHOST: db
+      DBPORT: "1521"
+      DBSERVICENAME: FREEPDB1
+      ORACLE_PWD: ${ORACLE_PWD}
+      # Senha do pool do APEX (APEX_PUBLIC_USER)
+      APEX_PWD: ${APEX_PWD:?defina em .env (./preparar.sh gera)}
+      # Senha do ORDS_PUBLIC_USER (obrigatória na imagem 26.x)
+      ORACLE_USER_PWD: ${ORDS_PWD:?defina em .env (./preparar.sh gera)}
+    ports:
+      - "127.0.0.1:${ORDS_PORTA:-8080}:8080"
+    volumes:
+      # Arquivos do APEX (./preparar.sh baixa): a imagem instala/atualiza o
+      # APEX no banco na primeira subida e serve as imagens em /i/
+      - ./apex:/opt/oracle/apex:ro
+      - ords_config:/etc/ords/config
+
+volumes:
+  oradata:
+  ords_config:

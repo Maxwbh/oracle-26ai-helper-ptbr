@@ -9,6 +9,7 @@
 -- Embedding direto de documento inteiro perde nuance — precisa chunking.
 --
 -- Revisado: nov/2026 contra a documentação Oracle AI Database 26ai (RU 23.26.4)
+-- Testado: 26ai Free 23.26.3 (nov/2026), SQL*Plus — chunking, embeddings e package OK; provedor externo não testado (sem credencial)
 -- Tipo: Dependente de configuração — modelo ONNX no banco; provedor externo exige rede, ACL e credencial
 -- RU mínimo: 23.26.0 (qualquer 26ai)
 -- Edição Free: Parcial — chunking e embedding com modelo ONNX no banco rodam
